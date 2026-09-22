@@ -809,4 +809,314 @@
         floatEl.style.left = sl + 'px';
         floatEl.style.top = st + 'px';
         floatEl.style.right = 'auto';
-        try { el.setPointerCapture(pid); } catch (_
+        try { el.setPointerCapture(pid); } catch (_) { /* ignore */ }
+      });
+      el.addEventListener('pointermove', (e) => {
+        if (e.pointerId !== pid) return;
+        const dx = e.clientX - sx, dy = e.clientY - sy;
+        if (!moved && Math.hypot(dx, dy) < 4) return;
+        moved = true;
+        const w = floatEl.offsetWidth, h = floatEl.offsetHeight;
+        const vw = window.innerWidth, vh = window.innerHeight;
+        const nx = Math.max(0, Math.min(vw - w, sl + dx));
+        const ny = Math.max(0, Math.min(vh - h, st + dy));
+        floatEl.style.left = nx + 'px';
+        floatEl.style.top = ny + 'px';
+      });
+      const end = (e) => {
+        if (pid == null || (e && e.pointerId !== pid)) return;
+        try { el.releasePointerCapture(pid); } catch (_) { /* ignore */ }
+        pid = null;
+        if (moved) {
+          const r = floatEl.getBoundingClientRect();
+          saveFloatPos(Math.round(r.left), Math.round(r.top));
+          const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+          floatEl.addEventListener('click', swallow, { capture: true, once: true });
+          setTimeout(() => floatEl.removeEventListener('click', swallow, { capture: true }), 300);
+        }
+      };
+      el.addEventListener('pointerup', end);
+      el.addEventListener('pointercancel', end);
+    };
+    makeDrag(badge);
+    makeDrag(handle);
+  }
+
+  function setFloatCollapsed(collapsed) {
+    if (!floatEl) return;
+    floatCollapsed = !!collapsed;
+    floatEl.classList.toggle('so-nb-float-collapsed', floatCollapsed);
+    if (floatCollapsed) {
+      floatEl.classList.remove('so-nb-float-fresh');
+      floatFresh = false;
+    }
+  }
+
+  function setFloatContent(text) {
+    if (!floatEl) return;
+    const el = floatEl.querySelector('#so-nb-float-content');
+    if (el) el.textContent = text || '（暂无建议）';
+  }
+
+  function setFloatVisible(on) {
+    const s = loadSettings();
+    s.showFloat = !!on;
+    saveSettings();
+    syncSettingsUI();
+    applyFloatVisibility();
+  }
+
+  function applyFloatVisibility() {
+    const s = loadSettings();
+    if (!s.showFloat) {
+      if (floatEl) floatEl.classList.add('so-nb-float-hidden');
+      return;
+    }
+    const el = ensureFloat();
+    el.classList.remove('so-nb-float-hidden');
+    const entry = getLast();
+    if (entry && entry.suggestion) {
+      setFloatContent(entry.suggestion);
+      setFloatCollapsed(false);
+    } else {
+      setFloatContent('（暂无建议）');
+      setFloatCollapsed(true);
+    }
+  }
+
+  function notifyFloatNewSuggestion(suggestion) {
+    const s = loadSettings();
+    if (!s.showFloat) return;
+    const el = ensureFloat();
+    el.classList.remove('so-nb-float-hidden');
+    setFloatContent(suggestion);
+    if (floatCollapsed) {
+      floatFresh = true;
+      el.classList.add('so-nb-float-fresh');
+    } else {
+      floatFresh = false;
+      el.classList.remove('so-nb-float-fresh');
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 触发：每条新的 AI 回复
+  // -------------------------------------------------------------------------
+
+  function isAiMessage(ctx, messageId) {
+    const m = ctx && ctx.chat && ctx.chat[messageId];
+    if (!m || m.is_user || m.is_system) return false;
+    return typeof m.mes === 'string' && m.mes.trim().length > 0;
+  }
+
+  async function onMessageRendered(messageId) {
+    const settings = loadSettings();
+    if (!settings.enabled) return;
+
+    const ctx = getCtx();
+    if (!ctx || !isAiMessage(ctx, messageId)) return;
+
+    const m = ctx.chat[messageId];
+    const swipeId = m.swipe_id || 0;
+    const key = `${chatKey()}:${messageId}:${swipeId}`;
+
+    if (isDone(key)) return;
+
+    const narrative = cleanNarrative(m.mes);
+    if (!narrative || narrative.length < MIN_NARRATIVE_LEN) return;
+
+    markDone(key);
+
+    const beatInfo = getActiveBeatInfo();
+    const myKey = key;
+    lastRequestKey = myKey;
+
+    const suggestion = await requestNextBeatOption(narrative, beatInfo);
+
+    if (lastRequestKey !== myKey) return;
+    if (!suggestion) return;
+    const cur = ctx.chat[messageId];
+    if (!cur || ((cur.swipe_id || 0) !== swipeId)) return;
+
+    setLast({ suggestion, beatInfo, messageId });
+    renderChip(messageId, suggestion, beatInfo);
+    showSuggestionToast(suggestion);
+    notifyFloatNewSuggestion(suggestion);
+  }
+
+  // -------------------------------------------------------------------------
+  // 事件绑定
+  // -------------------------------------------------------------------------
+
+  function bindEvents() {
+    const ctx = getCtx();
+    if (!ctx || !ctx.eventSource || !ctx.event_types) {
+      setTimeout(bindEvents, 500);
+      return;
+    }
+    const et = ctx.event_types;
+    const on = (ev, fn) => { try { ctx.eventSource.on(ev, fn); } catch (e) { /* ignore */ } };
+
+    on(et.CHARACTER_MESSAGE_RENDERED, (id) => {
+      Promise.resolve(onMessageRendered(id)).catch((e) => console.warn('[next-beat] 处理失败：', e));
+      setTimeout(refreshChips, 50);
+    });
+    ['MESSAGE_SWIPED', 'MESSAGE_EDITED', 'MESSAGE_DELETED'].forEach((name) => {
+      if (et[name]) on(et[name], () => setTimeout(refreshChips, 30));
+    });
+    if (et.CHAT_CHANGED) on(et.CHAT_CHANGED, () => {
+      removeAllChips();
+      setTimeout(rehangChips, 100);
+      updatePanel();
+      applyFloatVisibility();
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // 魔杖菜单入口
+  // -------------------------------------------------------------------------
+
+  const WAND_ID = 'so-next-beat-wand-button';
+
+  function injectWandButton() {
+    const menu = document.getElementById('extensionsMenu');
+    if (!menu) return false;
+    if (document.getElementById(WAND_ID) && menu.contains(document.getElementById(WAND_ID))) return true;
+
+    const old = document.getElementById(WAND_ID);
+    if (old) old.remove();
+
+    const item = document.createElement('div');
+    item.id = WAND_ID;
+    item.className = 'list-group-item flex-container flexGap5 interactable';
+    item.tabIndex = 0;
+    item.innerHTML = '<i class="fa-solid fa-compass"></i><span>下一拍建议</span>';
+    item.addEventListener('click', () => togglePanel(true));
+    menu.appendChild(item);
+    return true;
+  }
+
+  function watchWandMenu() {
+    if (!injectWandButton()) {
+      const mo = new MutationObserver(() => {
+        if (injectWandButton()) mo.disconnect();
+      });
+      mo.observe(document.body, { childList: true, subtree: true });
+      return;
+    }
+    const menu = document.getElementById('extensionsMenu');
+    if (menu) {
+      const mo = new MutationObserver(() => { injectWandButton(); });
+      mo.observe(menu, { childList: true, subtree: true });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 设置面板
+  // -------------------------------------------------------------------------
+
+  function syncSettingsUI() {
+    const s = loadSettings();
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
+    set('so_next_beat_enabled', s.enabled);
+    set('so_next_beat_chip', s.showChip);
+    set('so_next_beat_toast', s.showToast);
+    set('so_next_beat_float', s.showFloat);
+    if (panelEl && panelEl.isConnected) {
+      set('so-nb-panel-enabled', s.enabled);
+      set('so-nb-panel-chip', s.showChip);
+      set('so-nb-panel-toast', s.showToast);
+      set('so-nb-panel-float', s.showFloat);
+    }
+  }
+
+  function addSettingsUI() {
+    if (document.getElementById('so-next-beat-settings')) return;
+    const container = document.querySelector('#extensions_settings2, #extensions_settings');
+    if (!container) return;
+
+    const div = document.createElement('div');
+    div.id = 'so-next-beat-settings';
+    div.className = 'so-next-beat-settings';
+    div.innerHTML = `
+      <h4>🧭 下一拍建议（配套故事神谕，独立扩展 v${VERSION}）</h4>
+      <label class="checkbox_label">
+        <input id="so_next_beat_enabled" type="checkbox">
+        正文生成后自动生成「下一拍」的玩家指令建议
+      </label>
+      <label class="checkbox_label">
+        <input id="so_next_beat_chip" type="checkbox">
+        在对应回复下方显示建议
+      </label>
+      <label class="checkbox_label">
+        <input id="so_next_beat_toast" type="checkbox">
+        额外用右下角浮窗提示
+      </label>
+      <label class="checkbox_label">
+        <input id="so_next_beat_float" type="checkbox">
+        悬浮窗常驻（折叠成 🧭 圆标）
+      </label>
+      <p style="opacity:0.7; font-size:0.85em;">
+        也可以点输入框旁 🪄 菜单里的「下一拍建议」打开小窗口。
+      </p>
+    `;
+    container.appendChild(div);
+    syncSettingsUI();
+
+    const bindToggle = (id, key) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.addEventListener('change', function () {
+        const s = loadSettings();
+        s[key] = this.checked;
+        saveSettings();
+        syncSettingsUI();
+        if (key === 'showChip') refreshChips();
+        if (key === 'showFloat') applyFloatVisibility();
+      });
+    };
+    bindToggle('so_next_beat_enabled', 'enabled');
+    bindToggle('so_next_beat_chip', 'showChip');
+    bindToggle('so_next_beat_toast', 'showToast');
+    bindToggle('so_next_beat_float', 'showFloat');
+  }
+
+  // -------------------------------------------------------------------------
+  // 等 story-oracle 就绪
+  // -------------------------------------------------------------------------
+
+  function waitForStoryOracle(callback) {
+    if (window.StoryOracleAPI) { callback(); return; }
+    document.addEventListener('story-oracle-ready', callback, { once: true });
+    let tries = 0;
+    const timer = setInterval(() => {
+      tries += 1;
+      if (window.StoryOracleAPI) { clearInterval(timer); callback(); }
+      else if (tries > 30) { clearInterval(timer); console.warn('[next-beat] 等待故事神谕超时'); }
+    }, 500);
+  }
+
+  // -------------------------------------------------------------------------
+  // 启动
+  // -------------------------------------------------------------------------
+
+  jQuery(async () => {
+    waitForStoryOracle(() => {
+      const api = window.StoryOracleAPI;
+      if (!api) {
+        console.warn('[next-beat] 没有检测到故事神谕（StoryOracleAPI），本扩展不生效');
+        return;
+      }
+      if (typeof api.isCompatible === 'function' && !api.isCompatible(1)) {
+        console.warn('[next-beat] 故事神谕接口版本不兼容，本扩展跳过');
+        return;
+      }
+      addSettingsUI();
+      bindEvents();
+      watchWandMenu();
+      refreshChips();
+      applyFloatVisibility();
+      console.log('[next-beat] 已加载（v' + VERSION + '）');
+    });
+  });
+})();
