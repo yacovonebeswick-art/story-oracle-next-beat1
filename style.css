@@ -1,5 +1,5 @@
 /* ============================================================================
- * 故事神谕 · 下一拍建议 —— v3.5.0
+ * 故事神谕 · 下一拍建议 —— v3.6.0
  * ========================================================================== */
 
 /* ---- Chip：贴在 AI 回复下方（候选结果的唯一展示位）------------------- */
@@ -315,12 +315,25 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding-left: 4px;
+  padding-left: 8px;
   border-left: 2px solid rgba(128, 128, 128, 0.25);
   margin-top: 4px;
 }
+.so-nb-conn-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.so-nb-conn-status {
+  font-size: 0.82em;
+  opacity: 0.75;
+}
+.so-nb-conn-status.so-nb-conn-status-err {
+  color: #e88;
+  opacity: 1;
+}
 
-/* ---- 悬浮球 / 悬浮窗（极简：状态 + 两按钮）--------------------------- */
+/* ---- 悬浮球 / 悬浮窗 --------------------------------------------------- */
 
 #so-nb-float {
   position: fixed;
