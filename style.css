@@ -1,15 +1,22 @@
+/* ============================================================================
+ * 故事神谕 · 下一拍建议 —— v2.0.0
+ * ========================================================================== */
+
+/* ---- 贴在 AI 回复下方的建议 chip ---------------------------------------- */
+
 .so-next-beat-chip {
-  margin: 6px 0 2px 0;
-  padding: 6px 10px;
+  margin: 6px 0 4px 0;
+  padding: 8px 12px;
   border-radius: 8px;
-  border: 1px dashed rgba(128, 128, 128, 0.5);
-  font-size: 0.85em;
-  opacity: 0.85;
+  border: 1px dashed rgba(128, 128, 128, 0.55);
+  font-size: 0.9em;
+  opacity: 0.9;
   cursor: pointer;
   user-select: none;
-  transition: opacity 0.15s ease, background-color 0.15s ease;
-  display: inline-block;
+  transition: opacity 0.15s ease, background-color 0.15s ease, border-color 0.15s ease;
+  display: block;
   max-width: 100%;
+  line-height: 1.5;
 }
 
 .so-next-beat-chip:hover {
@@ -17,10 +24,199 @@
   background-color: rgba(128, 128, 128, 0.12);
 }
 
-.so-next-beat-chip .so-next-beat-text {
-  font-style: italic;
+.so-next-beat-chip.so-next-beat-chip-used {
+  border-style: solid;
+  border-color: rgba(74, 144, 217, 0.7);
 }
+
+.so-next-beat-chip-label {
+  display: block;
+  font-size: 0.82em;
+  opacity: 0.7;
+  margin-bottom: 2px;
+}
+
+.so-next-beat-chip-text {
+  display: block;
+  font-style: italic;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---- 右下角浮窗（可选，默认关） ---------------------------------------- */
+
+#so-next-beat-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 90px;
+  max-width: 340px;
+  background: var(--SmartThemeBlurTintColor, #1e1e1e);
+  color: var(--SmartThemeBodyColor, #eee);
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.15));
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+  z-index: 99999;
+  opacity: 0;
+  transform: translateY(12px);
+  pointer-events: none;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+#so-next-beat-toast.so-next-beat-show {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.so-next-beat-label {
+  font-size: 0.8em;
+  opacity: 0.7;
+  margin-bottom: 4px;
+}
+
+.so-next-beat-body {
+  font-size: 0.92em;
+  line-height: 1.4;
+  margin-bottom: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.so-next-beat-row {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.so-next-beat-btn {
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
+  background: transparent;
+  color: inherit;
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 0.85em;
+  cursor: pointer;
+}
+
+.so-next-beat-btn.so-next-beat-use {
+  background: var(--SmartThemeQuoteColor, #4a90d9);
+  border-color: transparent;
+  color: #fff;
+}
+
+.so-next-beat-btn:hover { filter: brightness(1.15); }
+
+/* ---- 扩展设置面板 -------------------------------------------------------- */
 
 .so-next-beat-settings h4 {
   margin-bottom: 4px;
+}
+
+.so-next-beat-settings .checkbox_label {
+  display: block;
+  margin: 4px 0;
+}
+
+/* ---- 浮动面板 ------------------------------------------------------------ */
+
+#so-next-beat-panel {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) scale(0.96);
+  width: 340px;
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 24px);
+  overflow: hidden;
+  background: var(--SmartThemeBlurTintColor, #1e1e1e);
+  color: var(--SmartThemeBodyColor, #eee);
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.15));
+  border-radius: 12px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+  z-index: 100000;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+#so-next-beat-panel.so-nb-panel-show {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate(-50%, -50%) scale(1);
+}
+
+.so-nb-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+  font-weight: 600;
+}
+
+.so-nb-panel-close {
+  cursor: pointer;
+  opacity: 0.7;
+  font-size: 1.15em;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+.so-nb-panel-close:hover { opacity: 1; }
+
+.so-nb-panel-body {
+  padding: 10px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: calc(100vh - 100px);
+  overflow-y: auto;
+}
+
+.so-nb-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}
+
+.so-nb-panel-label {
+  font-size: 0.85em;
+  opacity: 0.75;
+  margin-top: 4px;
+}
+
+.so-nb-panel-beat {
+  min-height: 32px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(74, 144, 217, 0.10);
+  font-size: 0.88em;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.so-nb-panel-suggestion {
+  min-height: 44px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 0.92em;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.so-nb-panel-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.so-nb-panel-row .so-next-beat-btn {
+  flex: 1;
+  text-align: center;
+  padding: 6px 10px;
 }
