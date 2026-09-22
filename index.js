@@ -1,25 +1,28 @@
 // ============================================================================
 // 故事神谕 · 下一拍建议（独立插件，不改 story-oracle 任何代码）
-// v3.1.0
+// v3.2.0
 //
-// 相对 v3.0.0 的修复：
-//   · 版本迁移：老档的 enabled 一律强制置 false（从此只有你手动点「生成建议」
-//     才会跑）；同时把 showFloat 恢复成 true（v2.1.0 的 × 曾误把设置改掉）。
-//   · prompt 硬约束：第 4~5 条【必须是不同角色】；只有一个在场角色就只给 1 条。
+// 关键语义（本版定稿）：
+//   · 悬浮球（🧭 圆标）：显示 / 隐藏【只由两处控制】——
+//       ① 面板里勾 / 取消「悬浮窗常驻」
+//       ② 魔杖菜单里点「下一拍建议」（= 打开面板 + 确保常驻勾上）
+//     任何其他动作（生成新候选 / 切聊天 / 刷新 / 打开面板 / 点 × ）都【不动】圆标。
+//   · × 按钮：只收起展开的卡片（折叠回圆标）。圆标永远还在。
+//   · 生成建议：手动点「生成建议」按钮才跑；默认不自动跑。
 // ============================================================================
 
 (function () {
   'use strict';
 
   const MODULE_ID = 'story-oracle-next-beat';
-  const VERSION = '3.1.0';
-  const CFG_VERSION = 3;   // 迁移版本号；低于此值触发一次性修复
+  const VERSION = '3.2.0';
+  const CFG_VERSION = 4;
 
   const DEFAULTS = {
     enabled: false,
     showChip: true,
     showToast: false,
-    showFloat: false,
+    showFloat: false,        // 只在用户主动勾 / 走魔杖菜单时变 true
   };
 
   const MIN_OUTPUT_TOKENS = 4096;
@@ -35,9 +38,8 @@
   let lastByChat = {};
   let panelEl = null;
   let floatEl = null;
-  let floatCollapsed = true;
+  let floatCollapsed = true;      // 卡片展开 / 折叠；圆标一直都在
   let floatFresh = false;
-  let floatUserHidden = false;
   let currentAbort = null;
   let lastRequestKey = null;
 
@@ -57,17 +59,16 @@
     return String(ctx.groupId || '') + '::' + String(ctx.chatId || '');
   }
 
-  // 一次性迁移：
-  //   · 老档（无 _v 或 _v < 3）：enabled 强制置 false；showFloat 恢复 true。
-  //   · 打上 _v = CFG_VERSION 后不再跑。
   function migrateSettings(s) {
     if (s._v === CFG_VERSION) return;
-    // 从任意旧版升上来 —— 这两件是"修旧版坑"，不是改用户当前偏好：
-    s.enabled = false;    // 旧版默认开；改成"必须手动点"才符合新语义
-    s.showFloat = true;   // 旧版 × 曾把设置改成 false；恢复"常驻"
+    // 从任意旧版升上来：
+    //   · enabled 一律关（v3 起默认手动）
+    //   · showFloat 若曾被旧版 × 误改掉，恢复 true（修旧版坑）
+    s.enabled = false;
+    if (!s.showFloat) s.showFloat = true;
     s._v = CFG_VERSION;
     saveSettings();
-    console.log('[next-beat] 已迁移设置到 v' + CFG_VERSION + '（自动生成已关；悬浮窗已恢复常驻）');
+    console.log('[next-beat] 已迁移设置到 v' + CFG_VERSION);
   }
 
   function loadSettings() {
@@ -119,7 +120,7 @@
   function isDone(key) { return readDoneSet().has(key); }
 
   // -------------------------------------------------------------------------
-  // unsafe.eval 封装
+  // unsafe.eval
   // -------------------------------------------------------------------------
 
   function apiSafeEval(expr, fallback) {
@@ -191,7 +192,7 @@
     '  · 前 3 条必须是 **我**（三个不同角度的合理应对：直接回应 / 另一角度 / 更主动的做法）。' +
     '  · 第 4~5 条：使用 **角色X**。' +
     '    ⚠ 硬约束：第 4 条与第 5 条【必须是不同的角色】——不允许同一角色换角度写两条。' +
-    '    如果最近正文里【只有一个】其他角色在场：只给第 4 条（一个角色），不给第 5 条。' +
+    '    如果最近正文里【只有一个】其他角色在场：只给第 4 条，不给第 5 条。' +
     '    如果最近正文里【没有】其他角色在场：不给第 4~5 条，只给前 3 条。' +
     '  · 只有当【本拍目标】明确暗示需要换场/换时间（例如目标里含「次日」「翌日」' +
     '    「数日后」「转场」「到了……」等）时，才在最后追加一条 **时间** 选项；' +
@@ -328,7 +329,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // 候选列表渲染（chip / 悬浮窗 / 面板共用）
+  // 候选列表渲染
   // -------------------------------------------------------------------------
 
   function labelClass(label) {
@@ -544,7 +545,7 @@
   function getLast() { return lastByChat[chatKey()] || null; }
 
   // -------------------------------------------------------------------------
-  // 触发（唯一入口：手动）
+  // 触发（手动）
   // -------------------------------------------------------------------------
 
   async function generateOptionsForMessage(messageId) {
@@ -619,7 +620,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // 自动触发（默认关；仅当你手动打开 enabled 时才生效）
+  // 自动触发（默认关）
   // -------------------------------------------------------------------------
 
   function isAiMessage(ctx, messageId) {
@@ -630,7 +631,7 @@
 
   async function onMessageRendered(messageId) {
     const s = loadSettings();
-    if (!s.enabled) return;   // 默认关
+    if (!s.enabled) return;
 
     const ctx = getCtx();
     if (!ctx || !isAiMessage(ctx, messageId)) return;
@@ -694,7 +695,7 @@
           <input type="checkbox" id="so-nb-panel-float" ${s.showFloat ? 'checked' : ''}>
           悬浮窗常驻（折叠成 🧭 圆标）
         </label>
-        <p class="so-nb-panel-label-hint">拖动圆标 / 标题栏可移动；位置会记住。</p>
+        <p class="so-nb-panel-label-hint">拖动圆标 / 标题栏可移动；位置会记住。圆标只有在这里取消勾选才会消失。</p>
         <div class="so-nb-panel-label">当前拍：</div>
         <div class="so-nb-panel-beat" id="so-nb-panel-beat">（未在引导序列中）</div>
         <div class="so-nb-panel-label">最近一次建议：</div>
@@ -774,10 +775,7 @@
         saveSettings();
         syncSettingsUI();
         if (key === 'showChip') refreshChips();
-        if (key === 'showFloat') {
-          if (this.checked) floatUserHidden = false;
-          applyFloatVisibility();
-        }
+        if (key === 'showFloat') applyFloatVisibility();
       });
     };
     bindToggle('#so-nb-panel-enabled', 'enabled');
@@ -847,8 +845,13 @@
   }
 
   // -------------------------------------------------------------------------
-  // 悬浮窗
+  // 悬浮球 / 悬浮窗
   // -------------------------------------------------------------------------
+  // 语义：
+  //   · 圆标显示 = showFloat 设置。除此之外【无任何】开关。
+  //   · × 按钮 = 只收起展开的卡片（= 折叠成圆标）。圆标永远在。
+  //   · 圆标的拖拽 = 移动位置；位置记 localStorage。
+  //   · 点圆标 = 展开 / 折叠卡片。
 
   const FLOAT_ID = 'so-nb-float';
   const FLOAT_POS_KEY = MODULE_ID + '_float_pos';
@@ -873,12 +876,11 @@
     floatEl.id = FLOAT_ID;
     floatEl.className = 'so-nb-float-hidden so-nb-float-collapsed';
     floatEl.innerHTML = `
-      <div class="so-nb-float-badge" title="🧭 下一拍建议（点开）">🧭</div>
+      <div class="so-nb-float-badge" title="🧭 下一拍建议（点开 / 折叠）">🧭</div>
       <div class="so-nb-float-body">
         <div class="so-nb-float-head" id="so-nb-float-drag-handle">
           <span class="so-nb-float-title">🧭 下一拍建议</span>
-          <span class="so-nb-float-icon-btn" id="so-nb-float-collapse" title="折叠">—</span>
-          <span class="so-nb-float-icon-btn" id="so-nb-float-close" title="本次隐藏（不影响设置里的常驻）">×</span>
+          <span class="so-nb-float-icon-btn" id="so-nb-float-close" title="收起卡片（圆标会保留）">×</span>
         </div>
         <div class="so-nb-float-content" id="so-nb-float-content">（暂无建议）</div>
         <div class="so-nb-float-actions">
@@ -895,20 +897,14 @@
       floatEl.style.right = 'auto';
     }
 
+    // 点圆标 = 展开；展开后再点圆标 = 折叠（圆标在展开态被卡片遮住，暂不生效，保留兼容）
     floatEl.querySelector('.so-nb-float-badge').addEventListener('click', () => {
-      if (floatCollapsed) {
-        setFloatCollapsed(false);
-        floatFresh = false;
-        floatEl.classList.remove('so-nb-float-fresh');
-      }
+      setFloatCollapsed(!floatCollapsed);
     });
 
-    floatEl.querySelector('#so-nb-float-collapse').addEventListener('click', () => setFloatCollapsed(true));
-
-    // ★ × 只做本次隐藏：不动设置里的 showFloat。
+    // ★ × 只收起卡片 → 折叠成圆标。圆标不消失。
     floatEl.querySelector('#so-nb-float-close').addEventListener('click', () => {
-      floatUserHidden = true;
-      floatEl.classList.add('so-nb-float-hidden');
+      setFloatCollapsed(true);
     });
 
     floatEl.querySelector('#so-nb-float-regen').addEventListener('click', async () => {
@@ -972,6 +968,10 @@
         if (moved) {
           const r = floatEl.getBoundingClientRect();
           saveFloatPos(Math.round(r.left), Math.round(r.top));
+          // 拖动过圆标 → 拦下随后补发的 click（防误触展开）
+          const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+          floatEl.addEventListener('click', swallow, { capture: true, once: true });
+          setTimeout(() => floatEl.removeEventListener('click', swallow, { capture: true }), 300);
         }
       };
       el.addEventListener('pointerup', end);
@@ -1003,36 +1003,38 @@
     }
   }
 
+  // 悬浮球的显示 / 隐藏 —— 唯一入口。只看 showFloat 设置，不看任何其他状态。
   function applyFloatVisibility() {
     const s = loadSettings();
-    if (!s.showFloat) { if (floatEl) floatEl.classList.add('so-nb-float-hidden'); return; }
-    if (floatUserHidden) return;
+    if (!s.showFloat) {
+      if (floatEl) floatEl.classList.add('so-nb-float-hidden');
+      return;
+    }
     const el = ensureFloat();
     el.classList.remove('so-nb-float-hidden');
     const entry = getLast();
     if (entry && Array.isArray(entry.options) && entry.options.length) {
       setFloatContent(entry.options);
+      // 有建议时自动展开卡片给用户看
       setFloatCollapsed(false);
     } else {
       setFloatContent('（暂无建议，点上面「生成 / 重新生成」）');
+      // 无建议时保持折叠（只显示圆标）
       setFloatCollapsed(true);
     }
   }
 
+  // 新建议到达 → 展开卡片显示（圆标一直在，不需要"恢复"操作）
   function notifyFloatNewOptions(options) {
     const s = loadSettings();
     if (!s.showFloat) return;
-    if (floatUserHidden) return;
     const el = ensureFloat();
     el.classList.remove('so-nb-float-hidden');
     setFloatContent(options);
-    if (floatCollapsed) {
-      floatFresh = true;
-      el.classList.add('so-nb-float-fresh');
-    } else {
-      floatFresh = false;
-      el.classList.remove('so-nb-float-fresh');
-    }
+    // 有新候选 → 自动展开卡片（用户能看到内容）；用户想收起点 × 即可
+    setFloatCollapsed(false);
+    floatFresh = false;
+    el.classList.remove('so-nb-float-fresh');
   }
 
   // -------------------------------------------------------------------------
@@ -1059,8 +1061,7 @@
       removeAllChips();
       setTimeout(rehangChips, 100);
       updatePanel();
-      floatUserHidden = false;   // 换聊天自动复位
-      applyFloatVisibility();
+      applyFloatVisibility();   // 圆标可见性只看设置，切聊天不改设置 → 不变
     });
   }
 
@@ -1083,8 +1084,9 @@
     item.tabIndex = 0;
     item.innerHTML = '<i class="fa-solid fa-compass"></i><span>下一拍建议</span>';
     item.addEventListener('click', () => {
-      floatUserHidden = false;   // 从菜单主动打开 = 解除本次隐藏
-      applyFloatVisibility();
+      // 走魔杖菜单 = 用户主动要用 → 确保常驻勾上 + 打开面板
+      const st = loadSettings();
+      if (!st.showFloat) { st.showFloat = true; saveSettings(); syncSettingsUI(); applyFloatVisibility(); }
       togglePanel(true);
     });
     menu.appendChild(item);
@@ -1165,10 +1167,7 @@
         saveSettings();
         syncSettingsUI();
         if (key === 'showChip') refreshChips();
-        if (key === 'showFloat') {
-          if (this.checked) floatUserHidden = false;
-          applyFloatVisibility();
-        }
+        if (key === 'showFloat') applyFloatVisibility();
       });
     };
     bindToggle('so_next_beat_enabled', 'enabled');
@@ -1178,7 +1177,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // 等待 story-oracle
+  // 等 story-oracle
   // -------------------------------------------------------------------------
 
   function waitForStoryOracle(callback) {
