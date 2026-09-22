@@ -1,28 +1,33 @@
 // ============================================================================
 // 故事神谕 · 下一拍建议（独立插件，不改 story-oracle 任何代码）
-// v3.2.0
+// v3.3.0
 //
-// 关键语义（本版定稿）：
-//   · 悬浮球（🧭 圆标）：显示 / 隐藏【只由两处控制】——
+// 设计（本版定稿）：
+//   · 楼层 chip（贴在 AI 回复下方）= 候选结果的【唯一展示位】。
+//   · 中心面板 / 悬浮球卡片 = 【快捷生成按钮】：
+//       - 点「生成建议」→ 立刻收起自己 → 结果只进楼层 chip。
+//       - 不再重复展示候选列表（避免重复 UI）。
+//   · 悬浮球（🧭 圆标）常驻；生成完圆标呼吸一下提示有新结果。
+//   · 圆标显示 / 隐藏【只由两处控制】：
 //       ① 面板里勾 / 取消「悬浮窗常驻」
 //       ② 魔杖菜单里点「下一拍建议」（= 打开面板 + 确保常驻勾上）
-//     任何其他动作（生成新候选 / 切聊天 / 刷新 / 打开面板 / 点 × ）都【不动】圆标。
+//     其他动作（生成 / × / 切聊天 / 刷新）都【不动】圆标的可见性。
 //   · × 按钮：只收起展开的卡片（折叠回圆标）。圆标永远还在。
-//   · 生成建议：手动点「生成建议」按钮才跑；默认不自动跑。
+//   · 生成建议：默认【手动点】才跑。
 // ============================================================================
 
 (function () {
   'use strict';
 
   const MODULE_ID = 'story-oracle-next-beat';
-  const VERSION = '3.2.0';
-  const CFG_VERSION = 4;
+  const VERSION = '3.3.0';
+  const CFG_VERSION = 5;
 
   const DEFAULTS = {
     enabled: false,
     showChip: true,
     showToast: false,
-    showFloat: false,        // 只在用户主动勾 / 走魔杖菜单时变 true
+    showFloat: false,
   };
 
   const MIN_OUTPUT_TOKENS = 4096;
@@ -38,7 +43,7 @@
   let lastByChat = {};
   let panelEl = null;
   let floatEl = null;
-  let floatCollapsed = true;      // 卡片展开 / 折叠；圆标一直都在
+  let floatCollapsed = true;
   let floatFresh = false;
   let currentAbort = null;
   let lastRequestKey = null;
@@ -61,9 +66,6 @@
 
   function migrateSettings(s) {
     if (s._v === CFG_VERSION) return;
-    // 从任意旧版升上来：
-    //   · enabled 一律关（v3 起默认手动）
-    //   · showFloat 若曾被旧版 × 误改掉，恢复 true（修旧版坑）
     s.enabled = false;
     if (!s.showFloat) s.showFloat = true;
     s._v = CFG_VERSION;
@@ -369,7 +371,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // Chip
+  // Chip（楼层下方 —— 候选结果的唯一展示位）
   // -------------------------------------------------------------------------
 
   function chipIdFor(messageId) { return 'so-next-beat-chip-' + messageId; }
@@ -645,7 +647,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // 中心面板
+  // 中心面板（= 快捷生成按钮容器）
   // -------------------------------------------------------------------------
 
   const PANEL_POS_KEY = MODULE_ID + '_panel_pos';
@@ -685,7 +687,7 @@
         </label>
         <label class="checkbox_label so-nb-toggle-row">
           <input type="checkbox" id="so-nb-panel-chip" ${s.showChip ? 'checked' : ''}>
-          在回复下方显示
+          在回复下方显示（结果展示位）
         </label>
         <label class="checkbox_label so-nb-toggle-row">
           <input type="checkbox" id="so-nb-panel-toast" ${s.showToast ? 'checked' : ''}>
@@ -695,11 +697,11 @@
           <input type="checkbox" id="so-nb-panel-float" ${s.showFloat ? 'checked' : ''}>
           悬浮窗常驻（折叠成 🧭 圆标）
         </label>
-        <p class="so-nb-panel-label-hint">拖动圆标 / 标题栏可移动；位置会记住。圆标只有在这里取消勾选才会消失。</p>
+        <p class="so-nb-panel-label-hint">本面板 / 悬浮球卡片只用来"触发生成"；结果固定显示在对应楼层的下方。圆标只有取消「常驻」才会消失。</p>
         <div class="so-nb-panel-label">当前拍：</div>
         <div class="so-nb-panel-beat" id="so-nb-panel-beat">（未在引导序列中）</div>
-        <div class="so-nb-panel-label">最近一次建议：</div>
-        <div class="so-nb-panel-suggestion" id="so-nb-panel-suggestion">（暂无）</div>
+        <div class="so-nb-panel-label">最近一次生成：</div>
+        <div class="so-nb-panel-suggestion" id="so-nb-panel-suggestion">（暂无 —— 点下方按钮生成）</div>
         <div class="so-nb-panel-row">
           <button type="button" id="so-nb-panel-regen" class="so-next-beat-btn so-next-beat-use">针对最新回复生成</button>
         </div>
@@ -783,6 +785,7 @@
     bindToggle('#so-nb-panel-toast', 'showToast');
     bindToggle('#so-nb-panel-float', 'showFloat');
 
+    // 面板 = 快捷生成：点完立刻收起面板；结果只会进楼层 chip。
     panelEl.querySelector('#so-nb-panel-regen').addEventListener('click', async () => {
       const ctx = getCtx();
       if (!ctx || !ctx.chat || !ctx.chat.length) return;
@@ -792,27 +795,24 @@
         if (m && !m.is_user && !m.is_system && typeof m.mes === 'string' && m.mes.trim()) { idx = i; break; }
       }
       if (idx === -1) { setPanelSuggestion(null); return; }
-      const btn = panelEl.querySelector('#so-nb-panel-regen');
-      const old = btn.textContent;
-      btn.textContent = '生成中…';
-      btn.disabled = true;
-      try { await triggerGenerateForMessage(idx); }
-      finally { btn.textContent = old; btn.disabled = false; }
+      togglePanel(false);   // 先收面板
+      await triggerGenerateForMessage(idx);
     });
 
     return panelEl;
   }
 
+  // 面板里的「最近一次生成」摘要 —— 只报个数，不再重复渲染候选列表
   function setPanelSuggestion(options) {
     if (!panelEl || !panelEl.isConnected) return;
     const host = panelEl.querySelector('#so-nb-panel-suggestion');
     if (!host) return;
     host.innerHTML = '';
     if (!Array.isArray(options) || !options.length) {
-      host.textContent = '（暂无）';
+      host.textContent = '（暂无 —— 点下方按钮生成）';
       return;
     }
-    host.appendChild(buildOptionsList(options, { onPick: (c) => { fillInput(c); togglePanel(false); } }));
+    host.textContent = `✓ 已生成 ${options.length} 条候选 —— 请到对应楼层下方查看 / 点选`;
   }
 
   function setPanelBeat(text) {
@@ -845,13 +845,8 @@
   }
 
   // -------------------------------------------------------------------------
-  // 悬浮球 / 悬浮窗
+  // 悬浮球 / 悬浮窗（= 快捷生成按钮容器）
   // -------------------------------------------------------------------------
-  // 语义：
-  //   · 圆标显示 = showFloat 设置。除此之外【无任何】开关。
-  //   · × 按钮 = 只收起展开的卡片（= 折叠成圆标）。圆标永远在。
-  //   · 圆标的拖拽 = 移动位置；位置记 localStorage。
-  //   · 点圆标 = 展开 / 折叠卡片。
 
   const FLOAT_ID = 'so-nb-float';
   const FLOAT_POS_KEY = MODULE_ID + '_float_pos';
@@ -882,7 +877,7 @@
           <span class="so-nb-float-title">🧭 下一拍建议</span>
           <span class="so-nb-float-icon-btn" id="so-nb-float-close" title="收起卡片（圆标会保留）">×</span>
         </div>
-        <div class="so-nb-float-content" id="so-nb-float-content">（暂无建议）</div>
+        <div class="so-nb-float-content" id="so-nb-float-content">（暂无 —— 点下方按钮生成）</div>
         <div class="so-nb-float-actions">
           <button type="button" class="so-next-beat-btn so-next-beat-use" id="so-nb-float-regen">生成 / 重新生成</button>
         </div>
@@ -897,7 +892,6 @@
       floatEl.style.right = 'auto';
     }
 
-    // 点圆标 = 展开；展开后再点圆标 = 折叠（圆标在展开态被卡片遮住，暂不生效，保留兼容）
     floatEl.querySelector('.so-nb-float-badge').addEventListener('click', () => {
       setFloatCollapsed(!floatCollapsed);
     });
@@ -907,25 +901,18 @@
       setFloatCollapsed(true);
     });
 
+    // 悬浮球卡片 = 快捷生成：点完立刻折叠；结果只会进楼层 chip。
     floatEl.querySelector('#so-nb-float-regen').addEventListener('click', async () => {
-      const btn = floatEl.querySelector('#so-nb-float-regen');
-      const old = btn.textContent;
-      btn.textContent = '生成中…';
-      btn.disabled = true;
-      try {
-        const ctx = getCtx();
-        if (!ctx || !ctx.chat || !ctx.chat.length) { setFloatContent('（找不到聊天）'); return; }
-        let idx = -1;
-        for (let i = ctx.chat.length - 1; i >= 0; i--) {
-          const m = ctx.chat[i];
-          if (m && !m.is_user && !m.is_system && typeof m.mes === 'string' && m.mes.trim()) { idx = i; break; }
-        }
-        if (idx === -1) { setFloatContent('（找不到可用的 AI 回复）'); return; }
-        await triggerGenerateForMessage(idx);
-      } finally {
-        btn.textContent = old;
-        btn.disabled = false;
+      const ctx = getCtx();
+      if (!ctx || !ctx.chat || !ctx.chat.length) { setFloatContent('（找不到聊天）'); return; }
+      let idx = -1;
+      for (let i = ctx.chat.length - 1; i >= 0; i--) {
+        const m = ctx.chat[i];
+        if (m && !m.is_user && !m.is_system && typeof m.mes === 'string' && m.mes.trim()) { idx = i; break; }
       }
+      if (idx === -1) { setFloatContent('（找不到可用的 AI 回复）'); return; }
+      setFloatCollapsed(true);   // 先折叠
+      await triggerGenerateForMessage(idx);
     });
 
     wireFloatDrag();
@@ -968,7 +955,6 @@
         if (moved) {
           const r = floatEl.getBoundingClientRect();
           saveFloatPos(Math.round(r.left), Math.round(r.top));
-          // 拖动过圆标 → 拦下随后补发的 click（防误触展开）
           const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
           floatEl.addEventListener('click', swallow, { capture: true, once: true });
           setTimeout(() => floatEl.removeEventListener('click', swallow, { capture: true }), 300);
@@ -991,6 +977,7 @@
     }
   }
 
+  // 悬浮球卡片展开时也显示候选（可选查看）；生成结果主要仍在楼层 chip
   function setFloatContent(opts) {
     if (!floatEl) return;
     const host = floatEl.querySelector('#so-nb-float-content');
@@ -999,11 +986,10 @@
     if (Array.isArray(opts) && opts.length) {
       host.appendChild(buildOptionsList(opts, { onPick: (c) => { fillInput(c); } }));
     } else {
-      host.textContent = typeof opts === 'string' ? opts : '（暂无建议）';
+      host.textContent = typeof opts === 'string' ? opts : '（暂无 —— 点下方按钮生成）';
     }
   }
 
-  // 悬浮球的显示 / 隐藏 —— 唯一入口。只看 showFloat 设置，不看任何其他状态。
   function applyFloatVisibility() {
     const s = loadSettings();
     if (!s.showFloat) {
@@ -1015,26 +1001,23 @@
     const entry = getLast();
     if (entry && Array.isArray(entry.options) && entry.options.length) {
       setFloatContent(entry.options);
-      // 有建议时自动展开卡片给用户看
-      setFloatCollapsed(false);
     } else {
-      setFloatContent('（暂无建议，点上面「生成 / 重新生成」）');
-      // 无建议时保持折叠（只显示圆标）
-      setFloatCollapsed(true);
+      setFloatContent('（暂无 —— 点下方按钮生成）');
     }
+    // 一律以折叠态出现在屏幕上；用户想看候选项才点圆标展开
+    setFloatCollapsed(true);
   }
 
-  // 新建议到达 → 展开卡片显示（圆标一直在，不需要"恢复"操作）
+  // 生成完 → 圆标呼吸一下提示「有新结果」；不自动展开（结果已在楼层 chip）
   function notifyFloatNewOptions(options) {
     const s = loadSettings();
     if (!s.showFloat) return;
     const el = ensureFloat();
     el.classList.remove('so-nb-float-hidden');
     setFloatContent(options);
-    // 有新候选 → 自动展开卡片（用户能看到内容）；用户想收起点 × 即可
-    setFloatCollapsed(false);
-    floatFresh = false;
-    el.classList.remove('so-nb-float-fresh');
+    setFloatCollapsed(true);
+    floatFresh = true;
+    el.classList.add('so-nb-float-fresh');
   }
 
   // -------------------------------------------------------------------------
@@ -1061,7 +1044,7 @@
       removeAllChips();
       setTimeout(rehangChips, 100);
       updatePanel();
-      applyFloatVisibility();   // 圆标可见性只看设置，切聊天不改设置 → 不变
+      applyFloatVisibility();
     });
   }
 
@@ -1084,7 +1067,6 @@
     item.tabIndex = 0;
     item.innerHTML = '<i class="fa-solid fa-compass"></i><span>下一拍建议</span>';
     item.addEventListener('click', () => {
-      // 走魔杖菜单 = 用户主动要用 → 确保常驻勾上 + 打开面板
       const st = loadSettings();
       if (!st.showFloat) { st.showFloat = true; saveSettings(); syncSettingsUI(); applyFloatVisibility(); }
       togglePanel(true);
@@ -1141,7 +1123,7 @@
       </label>
       <label class="checkbox_label">
         <input id="so_next_beat_chip" type="checkbox">
-        在对应回复下方显示建议
+        在对应回复下方显示建议（结果展示位）
       </label>
       <label class="checkbox_label">
         <input id="so_next_beat_toast" type="checkbox">
