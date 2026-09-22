@@ -1,8 +1,6 @@
 /* ============================================================================
- * 故事神谕 · 下一拍建议 —— v3.1.0
+ * 故事神谕 · 下一拍建议 —— v3.2.0
  * ========================================================================== */
-
-/* ---- Chip：贴在 AI 回复下方 -------------------------------------------- */
 
 .so-next-beat-chip {
   margin: 6px 0 4px 0;
@@ -17,14 +15,12 @@
   max-width: 100%;
   line-height: 1.5;
 }
-
 .so-next-beat-chip-idle {
   display: flex;
   flex-direction: column;
   gap: 6px;
   align-items: flex-start;
 }
-
 .so-next-beat-chip-label {
   display: block;
   font-size: 0.82em;
@@ -32,7 +28,6 @@
   margin-bottom: 2px;
   font-weight: 600;
 }
-
 .so-next-beat-chip-goal {
   font-size: 0.85em;
   opacity: 0.7;
@@ -41,7 +36,6 @@
   background: rgba(74, 144, 217, 0.10);
   border-radius: 6px;
 }
-
 .so-next-beat-chip-btn {
   border: 1px solid rgba(74, 144, 217, 0.7);
   background: rgba(74, 144, 217, 0.15);
@@ -51,10 +45,8 @@
   font-size: 0.85em;
   cursor: pointer;
 }
-
 .so-next-beat-chip-btn:hover { background: rgba(74, 144, 217, 0.28); }
 .so-next-beat-chip-btn:disabled { opacity: 0.6; cursor: default; }
-
 .so-next-beat-chip-btn-minor {
   border-color: rgba(128, 128, 128, 0.5);
   background: transparent;
@@ -62,7 +54,6 @@
   padding: 3px 10px;
 }
 .so-next-beat-chip-btn-minor:hover { background: rgba(128, 128, 128, 0.12); }
-
 .so-next-beat-chip-foot {
   display: flex;
   gap: 6px;
@@ -70,14 +61,11 @@
   padding-top: 6px;
   border-top: 1px dashed rgba(128, 128, 128, 0.3);
 }
-
 .so-next-beat-chip-err {
   font-size: 0.82em;
   color: #e88;
   margin-top: 4px;
 }
-
-/* ---- 候选列表 --------------------------------------------------------- */
 
 .so-nb-options {
   display: flex;
@@ -86,7 +74,6 @@
   margin: 4px 0;
   max-width: 100%;
 }
-
 .so-nb-option-row {
   display: flex;
   align-items: flex-start;
@@ -97,9 +84,7 @@
   transition: background-color 0.12s ease;
   line-height: 1.45;
 }
-
 .so-nb-option-row:hover { background-color: rgba(128, 128, 128, 0.14); }
-
 .so-nb-option-tag {
   flex: 0 0 auto;
   font-size: 0.85em;
@@ -109,25 +94,20 @@
   white-space: nowrap;
   margin-top: 1px;
 }
-
 .so-nb-lbl-user  { background: rgba(74, 144, 217, 0.20); color: #6fb3f0; }
 .so-nb-lbl-role  { background: rgba(160, 100, 220, 0.20); color: #c39bef; }
 .so-nb-lbl-time  { background: rgba(160, 160, 160, 0.20); color: #bbb; }
-
 .so-nb-option-text {
   flex: 1 1 auto;
   min-width: 0;
   word-break: break-word;
   white-space: pre-wrap;
 }
-
 .so-nb-empty {
   font-size: 0.85em;
   opacity: 0.6;
   padding: 4px 2px;
 }
-
-/* ---- 右下角浮窗（toast）------------------------------------------------ */
 
 #so-next-beat-toast {
   position: fixed;
@@ -146,27 +126,23 @@
   pointer-events: none;
   transition: opacity 0.2s ease, transform 0.2s ease;
 }
-
 #so-next-beat-toast.so-next-beat-show {
   opacity: 1;
   transform: translateY(0);
   pointer-events: auto;
 }
-
 .so-next-beat-label {
   font-size: 0.8em;
   opacity: 0.7;
   margin-bottom: 4px;
   font-weight: 600;
 }
-
 .so-next-beat-row {
   display: flex;
   justify-content: flex-end;
   gap: 6px;
   margin-top: 6px;
 }
-
 .so-next-beat-btn {
   border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
   background: transparent;
@@ -176,7 +152,6 @@
   font-size: 0.85em;
   cursor: pointer;
 }
-
 .so-next-beat-btn.so-next-beat-use {
   background: var(--SmartThemeQuoteColor, #4a90d9);
   border-color: transparent;
@@ -184,14 +159,10 @@
 }
 .so-next-beat-btn:hover { filter: brightness(1.15); }
 
-/* ---- 设置面板 --------------------------------------------------------- */
-
 .so-next-beat-settings h4 { margin-bottom: 4px; }
 .so-next-beat-settings .checkbox_label { display: block; margin: 4px 0; }
 
-/* ============================================================================
- * 中心面板
- * ========================================================================== */
+/* ---- 中心面板 ---------------------------------------------------------- */
 
 #so-next-beat-panel {
   position: fixed;
@@ -213,15 +184,12 @@
   pointer-events: none;
   transition: opacity 0.15s ease, transform 0.15s ease;
 }
-
 #so-next-beat-panel.so-nb-panel-show {
   opacity: 1;
   pointer-events: auto;
   transform: translateX(-50%) scale(1);
 }
-
 #so-next-beat-panel.so-nb-dragging { transition: none; }
-
 .so-nb-panel-header {
   display: flex;
   justify-content: space-between;
@@ -235,7 +203,6 @@
   flex: 0 0 auto;
 }
 .so-nb-panel-header.so-nb-dragging { cursor: grabbing; }
-
 .so-nb-panel-close {
   cursor: pointer;
   opacity: 0.7;
@@ -244,7 +211,6 @@
   padding: 0 4px;
 }
 .so-nb-panel-close:hover { opacity: 1; }
-
 .so-nb-panel-reset {
   cursor: pointer;
   opacity: 0.55;
@@ -254,7 +220,6 @@
   margin-right: 2px;
 }
 .so-nb-panel-reset:hover { opacity: 1; }
-
 .so-nb-panel-body {
   padding: 10px 14px 14px;
   display: flex;
@@ -265,18 +230,14 @@
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
-
 .so-nb-toggle-row { display: flex; align-items: center; gap: 6px; margin: 0; }
-
 .so-nb-panel-label { font-size: 0.85em; opacity: 0.75; margin-top: 4px; }
-
 .so-nb-panel-label-hint {
   font-size: 0.82em;
   opacity: 0.65;
   margin-left: 22px;
   margin-top: -2px;
 }
-
 .so-nb-panel-beat {
   min-height: 32px;
   padding: 6px 10px;
@@ -287,7 +248,6 @@
   white-space: pre-wrap;
   word-break: break-word;
 }
-
 .so-nb-panel-suggestion {
   min-height: 44px;
   padding: 8px 10px;
@@ -297,13 +257,10 @@
   line-height: 1.4;
   word-break: break-word;
 }
-
 .so-nb-panel-row { display: flex; gap: 8px; margin-top: 4px; }
 .so-nb-panel-row .so-next-beat-btn { flex: 1; text-align: center; padding: 6px 10px; }
 
-/* ============================================================================
- * 悬浮窗
- * ========================================================================== */
+/* ---- 悬浮球 / 悬浮窗 --------------------------------------------------- */
 
 #so-nb-float {
   position: fixed;
@@ -341,7 +298,6 @@
   border-color: rgba(74, 144, 217, 0.85);
   animation: so-nb-pulse 1.6s ease-in-out infinite;
 }
-
 @keyframes so-nb-pulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(74, 144, 217, 0.55); }
   50%      { box-shadow: 0 0 0 8px rgba(74, 144, 217, 0); }
@@ -357,7 +313,6 @@
   flex-direction: column;
   max-height: min(60vh, calc(100dvh - 24px));
 }
-
 #so-nb-float .so-nb-float-head {
   display: flex;
   align-items: center;
@@ -371,14 +326,12 @@
   user-select: none;
 }
 #so-nb-float .so-nb-float-head:active { cursor: grabbing; }
-
 #so-nb-float .so-nb-float-head .so-nb-float-title {
   flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
 #so-nb-float .so-nb-float-icon-btn {
   cursor: pointer;
   opacity: 0.7;
@@ -387,7 +340,6 @@
   user-select: none;
 }
 #so-nb-float .so-nb-float-icon-btn:hover { opacity: 1; }
-
 #so-nb-float .so-nb-float-content {
   padding: 8px 10px;
   font-size: 0.92em;
@@ -396,7 +348,6 @@
   -webkit-overflow-scrolling: touch;
   max-height: min(45vh, 360px);
 }
-
 #so-nb-float .so-nb-float-actions {
   display: flex;
   gap: 6px;
