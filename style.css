@@ -1,5 +1,5 @@
 /* ============================================================================
- * 故事神谕 · 下一拍建议 —— v3.0.0
+ * 故事神谕 · 下一拍建议 —— v3.1.0
  * ========================================================================== */
 
 /* ---- Chip：贴在 AI 回复下方 -------------------------------------------- */
@@ -61,7 +61,6 @@
   font-size: 0.8em;
   padding: 3px 10px;
 }
-
 .so-next-beat-chip-btn-minor:hover { background: rgba(128, 128, 128, 0.12); }
 
 .so-next-beat-chip-foot {
@@ -78,7 +77,7 @@
   margin-top: 4px;
 }
 
-/* ---- 候选列表（chip / 悬浮窗 / 面板共用）------------------------------ */
+/* ---- 候选列表 --------------------------------------------------------- */
 
 .so-nb-options {
   display: flex;
@@ -99,9 +98,7 @@
   line-height: 1.45;
 }
 
-.so-nb-option-row:hover {
-  background-color: rgba(128, 128, 128, 0.14);
-}
+.so-nb-option-row:hover { background-color: rgba(128, 128, 128, 0.14); }
 
 .so-nb-option-tag {
   flex: 0 0 auto;
@@ -185,10 +182,9 @@
   border-color: transparent;
   color: #fff;
 }
-
 .so-next-beat-btn:hover { filter: brightness(1.15); }
 
-/* ---- 扩展设置面板 ------------------------------------------------------ */
+/* ---- 设置面板 --------------------------------------------------------- */
 
 .so-next-beat-settings h4 { margin-bottom: 4px; }
 .so-next-beat-settings .checkbox_label { display: block; margin: 4px 0; }
@@ -238,7 +234,6 @@
   touch-action: none;
   flex: 0 0 auto;
 }
-
 .so-nb-panel-header.so-nb-dragging { cursor: grabbing; }
 
 .so-nb-panel-close {
@@ -248,7 +243,6 @@
   line-height: 1;
   padding: 0 4px;
 }
-
 .so-nb-panel-close:hover { opacity: 1; }
 
 .so-nb-panel-reset {
@@ -272,18 +266,9 @@
   -webkit-overflow-scrolling: touch;
 }
 
-.so-nb-toggle-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin: 0;
-}
+.so-nb-toggle-row { display: flex; align-items: center; gap: 6px; margin: 0; }
 
-.so-nb-panel-label {
-  font-size: 0.85em;
-  opacity: 0.75;
-  margin-top: 4px;
-}
+.so-nb-panel-label { font-size: 0.85em; opacity: 0.75; margin-top: 4px; }
 
 .so-nb-panel-label-hint {
   font-size: 0.82em;
@@ -313,17 +298,8 @@
   word-break: break-word;
 }
 
-.so-nb-panel-row {
-  display: flex;
-  gap: 8px;
-  margin-top: 4px;
-}
-
-.so-nb-panel-row .so-next-beat-btn {
-  flex: 1;
-  text-align: center;
-  padding: 6px 10px;
-}
+.so-nb-panel-row { display: flex; gap: 8px; margin-top: 4px; }
+.so-nb-panel-row .so-next-beat-btn { flex: 1; text-align: center; padding: 6px 10px; }
 
 /* ============================================================================
  * 悬浮窗
@@ -339,7 +315,6 @@
   max-width: min(340px, calc(100vw - 24px));
   transition: opacity 0.15s ease, transform 0.15s ease;
 }
-
 #so-nb-float.so-nb-float-hidden { display: none; }
 
 #so-nb-float.so-nb-float-collapsed .so-nb-float-body { display: none; }
@@ -360,7 +335,6 @@
   user-select: none;
   font-size: 1.15em;
 }
-
 #so-nb-float .so-nb-float-badge:hover { filter: brightness(1.15); }
 
 #so-nb-float.so-nb-float-fresh .so-nb-float-badge {
@@ -396,7 +370,6 @@
   touch-action: none;
   user-select: none;
 }
-
 #so-nb-float .so-nb-float-head:active { cursor: grabbing; }
 
 #so-nb-float .so-nb-float-head .so-nb-float-title {
@@ -413,7 +386,6 @@
   line-height: 1;
   user-select: none;
 }
-
 #so-nb-float .so-nb-float-icon-btn:hover { opacity: 1; }
 
 #so-nb-float .so-nb-float-content {
@@ -431,7 +403,6 @@
   padding: 8px 10px 10px;
   border-top: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
 }
-
 #so-nb-float .so-nb-float-actions .so-next-beat-btn {
   flex: 1;
   text-align: center;
