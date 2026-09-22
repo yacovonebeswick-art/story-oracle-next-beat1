@@ -1,16 +1,22 @@
 // ============================================================================
 // 故事神谕 · 下一拍建议（独立插件，不改 story-oracle 任何代码）
-// v3.4.0
+// v3.5.0
 //
-// 设计：
-//   · 楼层 chip（贴在 AI 回复下方）= 候选结果的【唯一展示位】。
-//   · 中心面板 = 触发容器（开关 + 生成按钮）。点完自动收起。
-//   · 悬浮球卡片 = 极简触发容器：
-//       展开后只有：一句话状态 + [生成 / 重新生成] + [跳到最新候选]
-//       绝不重复显示候选列表。
+// v3.5.0 新增：连接设置
+//   · 默认【继承故事神谕的连接设置】，只覆盖「模型名」（可以填一个便宜/快速的
+//     模型，专门给建议用，不占神谕的 pro 模型）。
+//   · 也可以取消勾选「继承」，改成【独立连接】：自己填 端点/密钥/连接模式/
+//     配置文件/后端转发/地址原样 等全套。
+//   · 走神谕内部传输层（unsafe.eval 拿 callDirect/callProfile/streamDirect），
+//     复用它的 URL 规范化、后端转发、附加参数、错误展开；
+//     拿不到内部函数时安全降级到「用神谕的 api.run」（= 现状）。
+//
+// 其它设计（沿用 v3.4.0）：
+//   · 楼层 chip = 候选结果的唯一展示位。
+//   · 中心面板 / 悬浮球卡片只用来"触发生成"；点完自动收起；不重复显示候选。
 //   · 悬浮球（🧭 圆标）常驻；生成完圆标呼吸提示。
-//   · 圆标显示 / 隐藏只由两处控制：面板里的「常驻」勾选、魔杖菜单入口。
-//   · × 只收起悬浮球卡片，圆标永远在。
+//   · 圆标显示 / 隐藏只由两处控制：面板「常驻」勾选、魔杖菜单入口。
+//   · × 只收起悬浮球卡片；圆标永远在。
 //   · 生成默认手动；自动开关默认关。
 // ============================================================================
 
@@ -18,14 +24,25 @@
   'use strict';
 
   const MODULE_ID = 'story-oracle-next-beat';
-  const VERSION = '3.4.0';
-  const CFG_VERSION = 6;
+  const VERSION = '3.5.0';
+  const CFG_VERSION = 7;
 
   const DEFAULTS = {
     enabled: false,
     showChip: true,
     showToast: false,
     showFloat: false,
+    // 连接设置
+    connInherit: true,        // 默认继承神谕的连接
+    connModelOverride: '',    // 继承模式下：覆盖的模型名（空 = 用神谕的模型）
+    // 独立连接（connInherit = false 时生效）
+    connMode: 'direct',       // 'direct' | 'profile'
+    connEndpoint: '',
+    connApiKey: '',
+    connModel: '',
+    connProfileId: '',
+    connDirectViaBackend: false,
+    connDirectRawUrl: false,
   };
 
   const MIN_OUTPUT_TOKENS = 4096;
@@ -241,7 +258,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // 解析 / 请求
+  // 解析
   // -------------------------------------------------------------------------
 
   function parseOptions(text) {
@@ -268,13 +285,23 @@
     return dedup.length ? dedup : null;
   }
 
+  // -------------------------------------------------------------------------
+  // 请求发送：三路分发
+  //   ① 继承 + 未覆盖模型 → api.run（现状：完全用神谕的模型与连接）
+  //   ② 继承 + 覆盖模型   → 借用神谕内部传输层，只覆盖 model
+  //   ③ 不继承（独立）   → 自己直连 / 走 profile
+  // -------------------------------------------------------------------------
+
   async function requestNextBeatOptions(narrativeText, beatInfo) {
     const api = window.StoryOracleAPI;
-    if (!api || typeof api.run !== 'function') {
-      console.warn('[next-beat] StoryOracleAPI.run 不可用，跳过');
+    if (!api) {
+      console.warn('[next-beat] 未检测到 StoryOracleAPI，跳过');
       return null;
     }
 
+    const s = loadSettings();
+
+    // 并发控制
     if (currentAbort) {
       try { currentAbort.abort(); } catch (e) { /* ignore */ }
     }
@@ -282,11 +309,12 @@
     currentAbort = ctl;
     const timer = setTimeout(() => { try { ctl.abort(); } catch (e) { /* ignore */ } }, REQUEST_TIMEOUT_MS);
 
+    // 输出预算
     let userMax = 0;
     try {
       if (typeof api.getSettings === 'function') {
-        const s = api.getSettings();
-        if (s && Number.isFinite(Number(s.maxTokens))) userMax = Number(s.maxTokens);
+        const os = api.getSettings();
+        if (os && Number.isFinite(Number(os.maxTokens))) userMax = Number(os.maxTokens);
       }
     } catch (e) { /* ignore */ }
     const maxTokens = Math.max(userMax, MIN_OUTPUT_TOKENS);
@@ -297,12 +325,27 @@
     ];
 
     try {
-      const result = await api.run(messages, { stream: false, maxTokens, signal: ctl.signal });
       let text = '';
-      if (typeof result === 'string') text = result;
-      else if (result && typeof result === 'object') {
-        text = result.text || result.content || result.reply || '';
+
+      if (s.connInherit) {
+        const override = String(s.connModelOverride || '').trim();
+        if (!override) {
+          // ① 完全跟随神谕
+          if (typeof api.run !== 'function') {
+            console.warn('[next-beat] api.run 不可用，跳过');
+            return null;
+          }
+          const result = await api.run(messages, { stream: false, maxTokens, signal: ctl.signal });
+          text = pickText(result);
+        } else {
+          // ② 继承连接，只覆盖 model
+          text = await sendWithModelOverride(api, messages, maxTokens, override, ctl.signal);
+        }
+      } else {
+        // ③ 完全独立连接
+        text = await sendWithOwnConnection(api, messages, maxTokens, s, ctl.signal);
       }
+
       text = String(text || '').trim();
       return parseOptions(text);
     } catch (err) {
@@ -313,6 +356,129 @@
       clearTimeout(timer);
       if (currentAbort === ctl) currentAbort = null;
     }
+  }
+
+  function pickText(result) {
+    if (typeof result === 'string') return result;
+    if (result && typeof result === 'object') {
+      return result.text || result.content || result.reply || '';
+    }
+    return '';
+  }
+
+  // 路径 ② —— 借用神谕内部传输层，覆盖模型名
+  async function sendWithModelOverride(api, messages, maxTokens, modelOverride, signal) {
+    // 先试着拿神谕内部的传输函数
+    const callDirect = apiSafeEval('(typeof callDirect === "function" ? callDirect : null)', null);
+    const callProfile = apiSafeEval('(typeof callProfile === "function" ? callProfile : null)', null);
+    const resolveEndpointUrl = apiSafeEval('(typeof resolveEndpointUrl === "function" ? resolveEndpointUrl : null)', null);
+    const getSettings = apiSafeEval('(typeof getSettings === "function" ? getSettings : null)', null);
+
+    const os = (typeof getSettings === 'function') ? getSettings() : null;
+    if (!os) {
+      // 拿不到神谕设置（极旧版本），退回 api.run
+      console.warn('[next-beat] 拿不到神谕设置，退回 api.run（用神谕模型）');
+      const result = await api.run(messages, { stream: false, maxTokens, signal });
+      return pickText(result);
+    }
+
+    const stream = false;   // 建议生成很短，不需要流式
+
+    if (os.mode === 'direct' && typeof callDirect === 'function' && typeof resolveEndpointUrl === 'function') {
+      const url = resolveEndpointUrl(os);
+      const body = { model: modelOverride, messages, max_tokens: maxTokens };
+      if (os.sendTemperature) body.temperature = os.temperature;
+      return await callDirect(url, os.apiKey, body, signal);
+    }
+
+    if (os.mode === 'profile' && typeof callProfile === 'function') {
+      // profile 模式的模型来自 profile 本身，无法覆盖 —— 用神谕自己的 profile 走一次，
+      // model override 只能通过 overridePayload 透传（ST 后端不读 model，但无害）。
+      const override = os.sendTemperature ? { temperature: os.temperature } : {};
+      return await callProfile(os.profileId, messages, maxTokens, override, signal);
+    }
+
+    // 兜底：走 api.run（用神谕模型）
+    console.warn('[next-beat] 无法覆盖模型（模式不支持），退回 api.run');
+    const result = await api.run(messages, { stream: false, maxTokens, signal });
+    return pickText(result);
+  }
+
+  // 路径 ③ —— 完全独立连接
+  async function sendWithOwnConnection(api, messages, maxTokens, s, signal) {
+    if (s.connMode === 'direct') {
+      if (!s.connEndpoint || !s.connModel) {
+        throw new Error('独立连接未配置：请到设置里填端点 URL 与模型');
+      }
+      const url = normalizeUrl(s.connEndpoint, s.connDirectRawUrl);
+      const body = { model: s.connModel, messages, max_tokens: maxTokens };
+      const headers = { 'Content-Type': 'application/json' };
+      if (s.connApiKey) headers['Authorization'] = 'Bearer ' + s.connApiKey;
+
+      if (s.connDirectViaBackend) {
+        return await sendViaSTBackend(url, headers, body, signal);
+      }
+      const res = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ ...body, stream: false }),
+        signal,
+      });
+      if (!res.ok) {
+        const t = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status} ${res.statusText} ${t.slice(0, 300)}`);
+      }
+      const data = await res.json();
+      return data?.choices?.[0]?.message?.content ?? '';
+    }
+
+    // profile 模式
+    if (!s.connProfileId) {
+      throw new Error('独立连接未配置：请到设置里选一个连接配置文件');
+    }
+    const ctx = getCtx();
+    if (!ctx || !ctx.ConnectionManagerRequestService || typeof ctx.ConnectionManagerRequestService.sendRequest !== 'function') {
+      throw new Error('此 ST 版本缺少 ConnectionManagerRequestService');
+    }
+    const override = {};
+    const result = await ctx.ConnectionManagerRequestService.sendRequest(
+      s.connProfileId,
+      messages,
+      maxTokens,
+      { stream: false, extractData: true, signal },
+      override,
+    );
+    return result?.content ?? '';
+  }
+
+  // 独立连接的「经酒馆后端转发」（直连 CORS 问题时用）
+  async function sendViaSTBackend(url, headers, body, signal) {
+    const ctx = getCtx();
+    if (!ctx || !ctx.ChatCompletionService || typeof ctx.ChatCompletionService.processRequest !== 'function') {
+      throw new Error('此 ST 版本缺少 ChatCompletionService，无法经后端转发');
+    }
+    const customUrl = String(url || '').replace(/\/chat\/completions\/?$/, '');
+    const { model, messages, max_tokens, stream: _drop, ...rest } = body || {};
+    const payload = {
+      chat_completion_source: 'custom',
+      custom_url: customUrl,
+      custom_include_headers: JSON.stringify(headers || {}),
+      model, messages, max_tokens,
+      stream: false,
+      ...rest,
+    };
+    const result = await ctx.ChatCompletionService.processRequest(payload, { presetName: undefined }, true, signal);
+    return result?.content ?? '';
+  }
+
+  // URL 规范化（与神谕同款逻辑）
+  function normalizeUrl(u, raw) {
+    u = String(u || '').trim().replace(/\/+$/, '');
+    if (!u) return u;
+    if (/\/chat\/completions$/.test(u)) return u;
+    if (/\/v\d+$/.test(u)) return u + '/chat/completions';
+    if (raw) return u + '/chat/completions';
+    return u + '/v1/chat/completions';
   }
 
   // -------------------------------------------------------------------------
@@ -580,7 +746,9 @@
     lastRequestKey = myKey;
 
     let out = null;
+    let errMsg = '';
     try { out = await generateOptionsForMessage(messageId); }
+    catch (e) { errMsg = String((e && e.message) || e); }
     finally { dismissToast(busyToast); }
 
     if (lastRequestKey !== myKey) return;
@@ -593,7 +761,7 @@
       if (idleChip) {
         const tip = document.createElement('div');
         tip.className = 'so-next-beat-chip-err';
-        tip.textContent = '（这次没能生成，看看控制台）';
+        tip.textContent = errMsg ? ('（生成失败：' + errMsg + '）') : '（这次没能生成，看看控制台）';
         idleChip.appendChild(tip);
       }
       return;
@@ -602,7 +770,7 @@
     setLast({ options: out.options, beatInfo: out.beatInfo, messageId });
     renderChipWithOptions(messageId, out.options, out.beatInfo);
     showSuggestionToast(out.options);
-    notifyFloatNewOptions();   // 悬浮球只呼吸提示，不塞候选
+    notifyFloatNewOptions();
     markDone(myKey);
   }
 
@@ -696,6 +864,63 @@
           悬浮窗常驻（折叠成 🧭 圆标）
         </label>
         <p class="so-nb-panel-label-hint">本面板 / 悬浮球只用来"触发生成"；结果固定显示在对应楼层的下方。圆标只有取消「常驻」才会消失。</p>
+
+        <details class="so-nb-conn" id="so-nb-conn-details">
+          <summary>连接设置（建议专用）</summary>
+          <div class="so-nb-conn-body">
+            <label class="checkbox_label so-nb-toggle-row">
+              <input type="checkbox" id="so-nb-conn-inherit" ${s.connInherit ? 'checked' : ''}>
+              继承故事神谕的连接设置（只覆盖下面的"模型名"）
+            </label>
+            <label class="so-nb-panel-label-hint" style="margin-left:22px; display:block;">
+              建议用的模型和主神谕模型不同（比如主用 pro，建议用轻量快速模型）时，勾选此项、在下框填模型名即可。留空 = 完全跟随神谕。
+            </label>
+            <label class="so-nb-field">
+              <span>模型名（继承模式下生效；可留空）</span>
+              <input type="text" id="so-nb-conn-model-override" value="${escapeAttr(s.connModelOverride)}" placeholder="例如 gpt-4o-mini / gemini-flash / deepseek-chat">
+            </label>
+
+            <div id="so-nb-conn-own">
+              <p class="so-nb-panel-label-hint">取消勾选「继承」后，以下独立连接设置生效：</p>
+              <label class="so-nb-field">
+                <span>连接模式</span>
+                <select id="so-nb-conn-mode">
+                  <option value="direct" ${s.connMode === 'direct' ? 'selected' : ''}>直连（自定义 URL）</option>
+                  <option value="profile" ${s.connMode === 'profile' ? 'selected' : ''}>连接配置文件</option>
+                </select>
+              </label>
+              <div id="so-nb-conn-direct">
+                <label class="so-nb-field">
+                  <span>端点 URL</span>
+                  <input type="text" id="so-nb-conn-endpoint" value="${escapeAttr(s.connEndpoint)}" placeholder="https://your-proxy.com/v1">
+                </label>
+                <label class="so-nb-field">
+                  <span>API 密钥</span>
+                  <input type="password" id="so-nb-conn-apikey" value="${escapeAttr(s.connApiKey)}" placeholder="sk-...">
+                </label>
+                <label class="so-nb-field">
+                  <span>模型</span>
+                  <input type="text" id="so-nb-conn-model" value="${escapeAttr(s.connModel)}" placeholder="gpt-4o-mini">
+                </label>
+                <label class="checkbox_label so-nb-toggle-row">
+                  <input type="checkbox" id="so-nb-conn-backend" ${s.connDirectViaBackend ? 'checked' : ''}>
+                  经酒馆后端转发（避免浏览器跨域 CORS）
+                </label>
+                <label class="checkbox_label so-nb-toggle-row">
+                  <input type="checkbox" id="so-nb-conn-rawurl" ${s.connDirectRawUrl ? 'checked' : ''}>
+                  地址原样使用（不自动补 /v1）
+                </label>
+              </div>
+              <div id="so-nb-conn-profile">
+                <label class="so-nb-field">
+                  <span>配置文件</span>
+                  <input type="text" id="so-nb-conn-profileid" value="${escapeAttr(s.connProfileId)}" placeholder="Connection Profile ID">
+                </label>
+              </div>
+            </div>
+          </div>
+        </details>
+
         <div class="so-nb-panel-label">当前拍：</div>
         <div class="so-nb-panel-beat" id="so-nb-panel-beat">（未在引导序列中）</div>
         <div class="so-nb-panel-label">最近一次生成：</div>
@@ -776,12 +1001,40 @@
         syncSettingsUI();
         if (key === 'showChip') refreshChips();
         if (key === 'showFloat') applyFloatVisibility();
+        if (key === 'connInherit') applyConnVisibility();
       });
     };
     bindToggle('#so-nb-panel-enabled', 'enabled');
     bindToggle('#so-nb-panel-chip', 'showChip');
     bindToggle('#so-nb-panel-toast', 'showToast');
     bindToggle('#so-nb-panel-float', 'showFloat');
+    bindToggle('#so-nb-conn-inherit', 'connInherit');
+    bindToggle('#so-nb-conn-backend', 'connDirectViaBackend');
+    bindToggle('#so-nb-conn-rawurl', 'connDirectRawUrl');
+
+    const bindInput = (id, key) => {
+      const el = panelEl.querySelector(id);
+      el.addEventListener('input', function () {
+        const st = loadSettings();
+        st[key] = this.value;
+        saveSettings();
+      });
+    };
+    bindInput('#so-nb-conn-model-override', 'connModelOverride');
+    bindInput('#so-nb-conn-endpoint', 'connEndpoint');
+    bindInput('#so-nb-conn-apikey', 'connApiKey');
+    bindInput('#so-nb-conn-model', 'connModel');
+    bindInput('#so-nb-conn-profileid', 'connProfileId');
+
+    const modeSel = panelEl.querySelector('#so-nb-conn-mode');
+    modeSel.addEventListener('change', function () {
+      const st = loadSettings();
+      st.connMode = this.value === 'profile' ? 'profile' : 'direct';
+      saveSettings();
+      applyConnVisibility();
+    });
+
+    applyConnVisibility();
 
     // 面板 = 快捷生成：点完立刻收起；结果只会进楼层 chip。
     panelEl.querySelector('#so-nb-panel-regen').addEventListener('click', async () => {
@@ -798,6 +1051,23 @@
     });
 
     return panelEl;
+  }
+
+  // 按 connInherit / connMode 显隐连接子面板
+  function applyConnVisibility() {
+    if (!panelEl || !panelEl.isConnected) return;
+    const s = loadSettings();
+    const ownBox = panelEl.querySelector('#so-nb-conn-own');
+    const directBox = panelEl.querySelector('#so-nb-conn-direct');
+    const profileBox = panelEl.querySelector('#so-nb-conn-profile');
+    const modelOverrideField = panelEl.querySelector('#so-nb-conn-model-override');
+    if (ownBox) ownBox.style.display = s.connInherit ? 'none' : '';
+    if (directBox) directBox.style.display = s.connMode === 'direct' ? '' : 'none';
+    if (profileBox) profileBox.style.display = s.connMode === 'profile' ? '' : 'none';
+    if (modelOverrideField) {
+      const label = modelOverrideField.closest('label');
+      if (label) label.style.display = s.connInherit ? '' : 'none';
+    }
   }
 
   function setPanelSuggestion(options) {
@@ -838,11 +1108,14 @@
     const el = ensurePanel();
     const show = forceShow !== undefined ? forceShow : !el.classList.contains('so-nb-panel-show');
     el.classList.toggle('so-nb-panel-show', show);
-    if (show) updatePanel();
+    if (show) {
+      applyConnVisibility();
+      updatePanel();
+    }
   }
 
   // -------------------------------------------------------------------------
-  // 悬浮球（极简：状态 + 两个按钮，绝不显示候选）
+  // 悬浮球（极简：状态 + 两个按钮）
   // -------------------------------------------------------------------------
 
   const FLOAT_ID = 'so-nb-float';
@@ -898,7 +1171,6 @@
       setFloatCollapsed(true);
     });
 
-    // 悬浮球卡片 = 快捷生成：点完立刻折叠；结果只会进楼层 chip。
     floatEl.querySelector('#so-nb-float-regen').addEventListener('click', async () => {
       const ctx = getCtx();
       if (!ctx || !ctx.chat || !ctx.chat.length) { setFloatContent('（找不到聊天）'); return; }
@@ -912,7 +1184,6 @@
       await triggerGenerateForMessage(idx);
     });
 
-    // 「跳到最新候选」：滚动到最近那一条有 chip 的楼层
     floatEl.querySelector('#so-nb-float-jump').addEventListener('click', () => {
       jumpToLatestChip();
     });
@@ -927,15 +1198,12 @@
       setFloatContent('（还没有候选 —— 先点「生成 / 重新生成」）');
       return;
     }
-    // 取 DOM 里最后一个（= 最新楼层的）chip
     const last = chips[chips.length - 1];
     try {
       last.scrollIntoView({ behavior: 'smooth', block: 'center' });
     } catch (e) {
-      // 老浏览器 / jsdom：退化为直接定位
       try { last.scrollIntoView(); } catch (_) { /* ignore */ }
     }
-    // 高亮一下，让用户一眼看到
     last.classList.add('so-nb-flash');
     setTimeout(() => last.classList.remove('so-nb-flash'), 1200);
   }
@@ -998,7 +1266,6 @@
     }
   }
 
-  // 悬浮球卡片正文 = 只放一句话状态。绝不显示候选。
   function setFloatContent(text) {
     if (!floatEl) return;
     const host = floatEl.querySelector('#so-nb-float-content');
@@ -1014,12 +1281,10 @@
     }
     const el = ensureFloat();
     el.classList.remove('so-nb-float-hidden');
-    // 折叠态出现；展开时才显示状态文案
     setFloatCollapsed(true);
     updateFloatStatus();
   }
 
-  // 悬浮球卡片里那一句状态——按"是否已生成"给不同话
   function updateFloatStatus() {
     const entry = getLast();
     if (entry && Array.isArray(entry.options) && entry.options.length) {
@@ -1029,7 +1294,6 @@
     }
   }
 
-  // 生成完 → 圆标呼吸提示；卡片若正展开则更新状态文案
   function notifyFloatNewOptions() {
     const s = loadSettings();
     if (!s.showFloat) return;
@@ -1110,7 +1374,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // 设置面板
+  // 设置面板（扩展设置区）
   // -------------------------------------------------------------------------
 
   function syncSettingsUI() {
@@ -1125,6 +1389,8 @@
       set('so-nb-panel-chip', s.showChip);
       set('so-nb-panel-toast', s.showToast);
       set('so-nb-panel-float', s.showFloat);
+      set('so-nb-conn-inherit', s.connInherit);
+      applyConnVisibility();
     }
   }
 
@@ -1155,7 +1421,7 @@
         悬浮窗常驻（折叠成 🧭 圆标）
       </label>
       <p style="opacity:0.7; font-size:0.85em;">
-        也可以点输入框旁 🪄 菜单里的「下一拍建议」打开小窗口。
+        也可以点输入框旁 🪄 菜单里的「下一拍建议」打开小窗口；连接设置也住在那个窗口里。
       </p>
     `;
     container.appendChild(div);
@@ -1177,6 +1443,13 @@
     bindToggle('so_next_beat_chip', 'showChip');
     bindToggle('so_next_beat_toast', 'showToast');
     bindToggle('so_next_beat_float', 'showFloat');
+  }
+
+  // HTML 属性转义
+  function escapeAttr(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+    });
   }
 
   // -------------------------------------------------------------------------
