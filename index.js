@@ -1,64 +1,43 @@
 // ============================================================================
 // 故事神谕 · 下一拍建议（独立插件，不改 story-oracle 任何代码）
-// v3.0.0
+// v3.1.0
 //
-// 功能：
-//   在 AI 每写完一条回复后，本插件支持【手动】触发一次建议生成：
-//     1) 通过 story-oracle 的 unsafe.eval 读到「当前正在引导的序列」以及
-//        「当前 active 拍」的 goal（= 玩家接下来要开启的这一拍）；
-//     2) 复用它自己那两个剥离函数（stripMechanismBlocks / stripReasoningTags）
-//        得到干净的正文；
-//     3) 调一次 story-oracle 已配置好的连接（api.run），让模型生成 3~6 条
-//        「玩家接下来可以发送的指令」候选，每条带一个主体标签：
-//          [我]      —— 玩家自己（第一人称）
-//          [角色X]   —— 最近正文里在场的其他角色（X 用正文里的称呼）
-//          [时间]    —— 时间推进 / 换场
-//     4) 把候选列表贴在对应 AI 回复下方（chip）+ 悬浮窗同步显示；
-//        点某一行 → 只填【内容】（去掉标签前缀）到输入框；
-//        也可一键填入整段（多行）。
-//
-// v3.0.0 相对 v2.1.0 的关键变化：
-//   - 生成【默认改为手动触发】（你点才发请求），自动生成的开关保留但默认关；
-//   - 输出从「单条建议」改成「3~6 条候选」，每条带主体标签；
-//   - prompt 明确「紧跟上文，不要凭空跳跃时间/地点」，仅当拍目标暗示换场时才给 [时间]；
-//   - 修复：悬浮窗 × 只隐藏、不再改动「常驻」设置；
-//   - 修复：建议默认不会在你没点「完成」时就生成（用当时的拍）。
-//
-// 依赖：story-oracle 在 1.21.0+ 暴露的 window.StoryOracleAPI（及 story-oracle-ready 事件）。
+// 相对 v3.0.0 的修复：
+//   · 版本迁移：老档的 enabled 一律强制置 false（从此只有你手动点「生成建议」
+//     才会跑）；同时把 showFloat 恢复成 true（v2.1.0 的 × 曾误把设置改掉）。
+//   · prompt 硬约束：第 4~5 条【必须是不同角色】；只有一个在场角色就只给 1 条。
 // ============================================================================
 
 (function () {
   'use strict';
 
   const MODULE_ID = 'story-oracle-next-beat';
-  const VERSION = '3.0.0';
+  const VERSION = '3.1.0';
+  const CFG_VERSION = 3;   // 迁移版本号；低于此值触发一次性修复
 
   const DEFAULTS = {
-    enabled: false,         // v3：自动生成默认【关】——改为手动触发省 API
-    showChip: true,         // 在回复下方显示 chip
-    showToast: false,       // 右下角 toast
-    showFloat: false,       // 悬浮窗
-    autoHideChipOnNew: true,// 生成新候选时清掉旧 chip（同一楼只留一份）
+    enabled: false,
+    showChip: true,
+    showToast: false,
+    showFloat: false,
   };
 
-  const MIN_OUTPUT_TOKENS = 4096;      // reasoning 模型思考也吃 max_tokens
+  const MIN_OUTPUT_TOKENS = 4096;
   const REQUEST_TIMEOUT_MS = 240000;
   const MIN_NARRATIVE_LEN = 10;
 
   const DONE_META_KEY = MODULE_ID + '_done';
   const DONE_KEEP_MAX = 400;
 
-  // 三类主体标签（固定槽位；角色槽位由模型用正文里的称呼替换）
   const LBL_USER = '我';
   const LBL_TIME = '时间';
-  const ROLE_SLOT_RE = /^角色[ABC]$/;  // 未被替换的槽位名，仍照常显示
 
-  let lastByChat = {};                 // { [chatKey]: { options, beatInfo, messageId, at } }
+  let lastByChat = {};
   let panelEl = null;
   let floatEl = null;
   let floatCollapsed = true;
   let floatFresh = false;
-  let floatUserHidden = false;         // 会话级：× 掉悬浮窗只置这个，不动设置
+  let floatUserHidden = false;
   let currentAbort = null;
   let lastRequestKey = null;
 
@@ -78,6 +57,19 @@
     return String(ctx.groupId || '') + '::' + String(ctx.chatId || '');
   }
 
+  // 一次性迁移：
+  //   · 老档（无 _v 或 _v < 3）：enabled 强制置 false；showFloat 恢复 true。
+  //   · 打上 _v = CFG_VERSION 后不再跑。
+  function migrateSettings(s) {
+    if (s._v === CFG_VERSION) return;
+    // 从任意旧版升上来 —— 这两件是"修旧版坑"，不是改用户当前偏好：
+    s.enabled = false;    // 旧版默认开；改成"必须手动点"才符合新语义
+    s.showFloat = true;   // 旧版 × 曾把设置改成 false；恢复"常驻"
+    s._v = CFG_VERSION;
+    saveSettings();
+    console.log('[next-beat] 已迁移设置到 v' + CFG_VERSION + '（自动生成已关；悬浮窗已恢复常驻）');
+  }
+
   function loadSettings() {
     const ctx = getCtx();
     if (!ctx) return { ...DEFAULTS };
@@ -86,7 +78,9 @@
       DEFAULTS,
       ctx.extensionSettings[MODULE_ID] || {},
     );
-    return ctx.extensionSettings[MODULE_ID];
+    const s = ctx.extensionSettings[MODULE_ID];
+    migrateSettings(s);
+    return s;
   }
 
   function saveSettings() {
@@ -97,7 +91,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // 持久去重（存 chat_metadata，页面刷新后仍有效）
+  // 持久去重
   // -------------------------------------------------------------------------
 
   function readDoneSet() {
@@ -122,9 +116,7 @@
     } catch (e) { /* ignore */ }
   }
 
-  function isDone(key) {
-    return readDoneSet().has(key);
-  }
+  function isDone(key) { return readDoneSet().has(key); }
 
   // -------------------------------------------------------------------------
   // unsafe.eval 封装
@@ -157,15 +149,9 @@
   }
 
   function getActiveBeatInfo() {
-    const seq = apiSafeEval(
-      '(typeof getSeq === "function" ? getSeq() : null)',
-      null,
-    );
+    const seq = apiSafeEval('(typeof getSeq === "function" ? getSeq() : null)', null);
     if (!seq || !Array.isArray(seq.beats) || !seq.beats.length) return null;
-    const active = apiSafeEval(
-      '(typeof seqActiveBeat === "function" ? seqActiveBeat(getSeq()) : null)',
-      null,
-    );
+    const active = apiSafeEval('(typeof seqActiveBeat === "function" ? seqActiveBeat(getSeq()) : null)', null);
     const beat = active || seq.beats[seq.cursor] || null;
     if (!beat) return null;
     return {
@@ -188,6 +174,7 @@
     '你是一个为角色扮演游戏生成「玩家下一步可发送指令」候选的助手。' +
     '用户会给你：当前剧情的最后一段正文，以及（如果有）当前正在引导的剧情序列中的某一拍目标。' +
     '你需要生成 3~6 条候选，每条都能作为「玩家」接下来直接发送给 AI 的指令。' +
+    '\n' +
     '输出格式（严格遵守）：每条一行，行首固定为「**标签** 」加一个空格，然后接具体内容。' +
     '标签只允许以下三类：' +
     '  1) **我**      —— 玩家自己（第一人称「我」）的动作/台词；' +
@@ -195,27 +182,31 @@
     'X 用正文里对这个人物的称呼替换（例如「胡一菲」）；' +
     '若模型无法确定具体是谁，则保留 **角色A** / **角色B** / **角色C**；' +
     '不要凭空发明正文里没出现过的人物。' +
-    '  3) **时间**    —— 时间推进 / 换场；只有当下述条件满足时才用。' +
+    '  3) **时间**    —— 时间推进 / 换场；只有在满足下述条件时才使用。' +
+    '\n' +
     '内容要求：' +
     '  · 每条 1~2 句，具体到可以立刻发送（带动作/台词/场景细节之一）；' +
     '  · 【紧跟上文】：不要凭空跳跃时间或地点；上一句若是对话/问句，' +
     '    大部分候选应当是【立即】的回应或行动，而不是「几小时后……」。' +
     '  · 前 3 条必须是 **我**（三个不同角度的合理应对：直接回应 / 另一角度 / 更主动的做法）。' +
-    '  · 若最近正文里有其他在场角色，则第 4~5 条使用 **角色X**（不同角色，' +
-    '    或同一角色的两个不同角度）。若最近正文里只有「我」和叙述、没有别的角色，' +
-    '    则省略 4~5，只给 3 条 **我**。' +
+    '  · 第 4~5 条：使用 **角色X**。' +
+    '    ⚠ 硬约束：第 4 条与第 5 条【必须是不同的角色】——不允许同一角色换角度写两条。' +
+    '    如果最近正文里【只有一个】其他角色在场：只给第 4 条（一个角色），不给第 5 条。' +
+    '    如果最近正文里【没有】其他角色在场：不给第 4~5 条，只给前 3 条。' +
     '  · 只有当【本拍目标】明确暗示需要换场/换时间（例如目标里含「次日」「翌日」' +
     '    「数日后」「转场」「到了……」等）时，才在最后追加一条 **时间** 选项；' +
     '    否则不给 **时间** 选项。' +
     '  · 行内不要出现 MBTI 分析、不要出现「（动作）」这类标注、不要引号外的解释。' +
     '  · 不要使用 Markdown 列表符号（- / *），只用上面规定的「**标签** 内容」格式。' +
+    '\n' +
     '示例（仅示范格式；实际人物/场景由你根据正文判断）：' +
     '**我** 我站起身，走到门口把帘子拉下。\n' +
     '**我** 我把杯子里的水一口喝掉，沉默了两秒。\n' +
     '**我** 我回头看了一眼，低声说：「我们换个地方谈。」\n' +
     '**角色A** 他靠在墙边，抱着胳膊没说话。\n' +
     '**角色B** 她放下手里的笔，抬头看向我。\n' +
-    '**时间** 半小时后，天色完全暗了下来。';
+    '**时间** 半小时后，天色完全暗了下来。\n' +
+    '（⚠ 错误示范，禁止照抄：两条都写成 **角色A** 只是角度不同——那样是同一个角色，不允许。）';
 
   function buildUserPrompt(narrativeText, beatInfo) {
     const parts = [];
@@ -237,30 +228,26 @@
       parts.push('请按系统提示规定的格式，生成 3~6 条候选。' +
         '所有候选的最终目标，都要能自然把剧情推向上面那个【本拍目标】；' +
         '其中至少一条应当是【紧接着上一句正文】的即时回应/行动，' +
-        '不要一上来就跨时间。');
+        '不要一上来就跨时间。' +
+        '再次提醒：第 4 条与第 5 条必须是不同的角色，不能同一角色写两条。');
     } else {
       parts.push('请按系统提示规定的格式，生成 3~6 条候选。' +
         '所有候选都要能顺着刚才这段正文自然展开下一步；' +
-        '其中至少一条应当是【紧接着上一句正文】的即时回应/行动。');
+        '其中至少一条应当是【紧接着上一句正文】的即时回应/行动。' +
+        '再次提醒：第 4 条与第 5 条必须是不同的角色，不能同一角色写两条。');
     }
     return parts.join('\n');
   }
 
   // -------------------------------------------------------------------------
-  // 调 API（返回结构化候选数组）
+  // 解析 / 请求
   // -------------------------------------------------------------------------
-  // 返回：[{ label, content, raw }] 或 null
-  //   · label   渲染用标签（"我" / "角色X" / "时间"）；角色槽位未替换时保留 "角色A" 等
-  //   · content 去掉标签前缀后的正文，点行时填这个
-  //   · raw     完整原始行（保底/调试用）
 
   function parseOptions(text) {
     const src = String(text || '');
     const out = [];
-    const lines = src.split(/\r?\n/);
-    // 匹配 「**标签** 内容」
     const re = /^\s*\*\*([^*\n]+?)\*\*\s+(.+?)\s*$/;
-    for (const line of lines) {
+    for (const line of src.split(/\r?\n/)) {
       if (!line.trim()) continue;
       const m = line.match(re);
       if (!m) continue;
@@ -269,7 +256,6 @@
       if (!label || !content) continue;
       out.push({ label, content, raw: line.trim() });
     }
-    // 去重（同一标签 + 同一内容）
     const seen = new Set();
     const dedup = [];
     for (const o of out) {
@@ -310,11 +296,7 @@
     ];
 
     try {
-      const result = await api.run(messages, {
-        stream: false,
-        maxTokens,
-        signal: ctl.signal,
-      });
+      const result = await api.run(messages, { stream: false, maxTokens, signal: ctl.signal });
       let text = '';
       if (typeof result === 'string') text = result;
       else if (result && typeof result === 'object') {
@@ -333,7 +315,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // 输入框填入
+  // 输入框
   // -------------------------------------------------------------------------
 
   function fillInput(text) {
@@ -346,7 +328,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // 通用：候选列表渲染（chip / 悬浮窗 / 面板共用）
+  // 候选列表渲染（chip / 悬浮窗 / 面板共用）
   // -------------------------------------------------------------------------
 
   function labelClass(label) {
@@ -355,7 +337,6 @@
     return 'so-nb-lbl-role';
   }
 
-  // 生成一块候选列表 DOM；onPick(content) 在点某一行时调用
   function buildOptionsList(options, opts) {
     const list = document.createElement('div');
     list.className = 'so-nb-options';
@@ -379,7 +360,7 @@
       row.appendChild(tag);
       row.appendChild(txt);
       row.addEventListener('click', () => {
-        if (typeof opts?.onPick === 'function') opts.onPick(o.content);
+        if (typeof (opts && opts.onPick) === 'function') opts.onPick(o.content);
       });
       list.appendChild(row);
     }
@@ -387,27 +368,18 @@
   }
 
   // -------------------------------------------------------------------------
-  // Chip（贴在 AI 回复下方）
+  // Chip
   // -------------------------------------------------------------------------
 
   function chipIdFor(messageId) { return 'so-next-beat-chip-' + messageId; }
+  function removeChip(id) { const el = document.getElementById(chipIdFor(id)); if (el) el.remove(); }
+  function removeAllChips() { document.querySelectorAll('.so-next-beat-chip').forEach((el) => el.remove()); }
 
-  function removeChip(messageId) {
-    const el = document.getElementById(chipIdFor(messageId));
-    if (el) el.remove();
-  }
-
-  function removeAllChips() {
-    document.querySelectorAll('.so-next-beat-chip').forEach((el) => el.remove());
-  }
-
-  // 未生成 → 显示「生成建议」按钮
   function renderChipIdle(messageId, beatInfo) {
-    const settings = loadSettings();
-    if (!settings.showChip) return;
+    const s = loadSettings();
+    if (!s.showChip) return;
     const $mes = document.querySelector('.mes[mesid="' + messageId + '"]');
     if (!$mes) return;
-
     removeChip(messageId);
 
     const chip = document.createElement('div');
@@ -422,37 +394,29 @@
     chip.appendChild(label);
 
     if (beatInfo && beatInfo.goal) {
-      const goalLine = document.createElement('div');
-      goalLine.className = 'so-next-beat-chip-goal';
-      goalLine.textContent = '目标：' + beatInfo.goal;
-      chip.appendChild(goalLine);
+      const g = document.createElement('div');
+      g.className = 'so-next-beat-chip-goal';
+      g.textContent = '目标：' + beatInfo.goal;
+      chip.appendChild(g);
     }
 
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'so-next-beat-chip-btn';
     btn.textContent = '生成建议';
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      triggerGenerateForMessage(messageId);
-    });
+    btn.addEventListener('click', (e) => { e.stopPropagation(); triggerGenerateForMessage(messageId); });
     chip.appendChild(btn);
 
     const anchor = $mes.querySelector('.mes_text');
-    if (anchor && anchor.parentNode) {
-      anchor.parentNode.insertBefore(chip, anchor.nextSibling);
-    } else {
-      $mes.appendChild(chip);
-    }
+    if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(chip, anchor.nextSibling);
+    else $mes.appendChild(chip);
   }
 
-  // 已生成 → 显示候选列表 + 重新生成按钮
   function renderChipWithOptions(messageId, options, beatInfo) {
-    const settings = loadSettings();
-    if (!settings.showChip) return;
+    const s = loadSettings();
+    if (!s.showChip) return;
     const $mes = document.querySelector('.mes[mesid="' + messageId + '"]');
     if (!$mes) return;
-
     removeChip(messageId);
 
     const chip = document.createElement('div');
@@ -467,15 +431,13 @@
     chip.appendChild(label);
 
     if (beatInfo && beatInfo.goal) {
-      const goalLine = document.createElement('div');
-      goalLine.className = 'so-next-beat-chip-goal';
-      goalLine.textContent = '目标：' + beatInfo.goal;
-      chip.appendChild(goalLine);
+      const g = document.createElement('div');
+      g.className = 'so-next-beat-chip-goal';
+      g.textContent = '目标：' + beatInfo.goal;
+      chip.appendChild(g);
     }
 
-    chip.appendChild(buildOptionsList(options, {
-      onPick: (content) => { fillInput(content); },
-    }));
+    chip.appendChild(buildOptionsList(options, { onPick: (c) => { fillInput(c); } }));
 
     const foot = document.createElement('div');
     foot.className = 'so-next-beat-chip-foot';
@@ -484,10 +446,7 @@
     regen.type = 'button';
     regen.className = 'so-next-beat-chip-btn so-next-beat-chip-btn-minor';
     regen.textContent = '重新生成';
-    regen.addEventListener('click', (e) => {
-      e.stopPropagation();
-      triggerGenerateForMessage(messageId);
-    });
+    regen.addEventListener('click', (e) => { e.stopPropagation(); triggerGenerateForMessage(messageId); });
     foot.appendChild(regen);
 
     const fillAll = document.createElement('button');
@@ -505,22 +464,14 @@
     chip.appendChild(foot);
 
     const anchor = $mes.querySelector('.mes_text');
-    if (anchor && anchor.parentNode) {
-      anchor.parentNode.insertBefore(chip, anchor.nextSibling);
-    } else {
-      $mes.appendChild(chip);
-    }
+    if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(chip, anchor.nextSibling);
+    else $mes.appendChild(chip);
   }
-
-  // -------------------------------------------------------------------------
-  // 全量重挂
-  // -------------------------------------------------------------------------
 
   function rehangChips() {
     const key = chatKey();
     const entry = lastByChat[key];
     if (!entry || entry.messageId == null) return;
-    // 只在【最新一条被生成过】的那一楼里重挂；未生成过的不显示空 chip
     if (Array.isArray(entry.options) && entry.options.length) {
       renderChipWithOptions(entry.messageId, entry.options, entry.beatInfo || null);
     }
@@ -551,8 +502,8 @@
   }
 
   function showSuggestionToast(options) {
-    const settings = loadSettings();
-    if (!settings.showToast) return;
+    const s = loadSettings();
+    if (!s.showToast) return;
     const el = ensureToastContainer();
     el.innerHTML = '';
 
@@ -561,19 +512,15 @@
     label.textContent = '🧭 下一拍建议';
     el.appendChild(label);
 
-    el.appendChild(buildOptionsList(options, {
-      onPick: (content) => { fillInput(content); hideSuggestionToast(); },
-    }));
+    el.appendChild(buildOptionsList(options, { onPick: (c) => { fillInput(c); hideSuggestionToast(); } }));
 
     const row = document.createElement('div');
     row.className = 'so-next-beat-row';
-
     const closeBtn = document.createElement('button');
     closeBtn.type = 'button';
     closeBtn.className = 'so-next-beat-btn';
     closeBtn.textContent = '×';
     closeBtn.addEventListener('click', hideSuggestionToast);
-
     row.appendChild(closeBtn);
     el.appendChild(row);
     el.classList.add('so-next-beat-show');
@@ -594,12 +541,10 @@
     updatePanel();
   }
 
-  function getLast() {
-    return lastByChat[chatKey()] || null;
-  }
+  function getLast() { return lastByChat[chatKey()] || null; }
 
   // -------------------------------------------------------------------------
-  // 触发（手动 / 自动都走这里）
+  // 触发（唯一入口：手动）
   // -------------------------------------------------------------------------
 
   async function generateOptionsForMessage(messageId) {
@@ -623,7 +568,6 @@
     const m = ctx.chat[messageId];
     if (!m || m.is_user || m.is_system) return;
 
-    // 生成中：先把 chip 切成「生成中…」
     const chip = document.getElementById(chipIdFor(messageId));
     if (chip) {
       const btn = chip.querySelector('.so-next-beat-chip-btn');
@@ -635,18 +579,14 @@
     lastRequestKey = myKey;
 
     let out = null;
-    try {
-      out = await generateOptionsForMessage(messageId);
-    } finally {
-      dismissToast(busyToast);
-    }
+    try { out = await generateOptionsForMessage(messageId); }
+    finally { dismissToast(busyToast); }
 
     if (lastRequestKey !== myKey) return;
     const cur = ctx.chat[messageId];
     if (!cur || ((cur.swipe_id || 0) !== (m.swipe_id || 0))) return;
 
     if (!out || !out.options || !out.options.length) {
-      // 失败：把 chip 变回「生成建议」按钮 + 友好提示
       renderChipIdle(messageId, getActiveBeatInfo());
       const idleChip = document.getElementById(chipIdFor(messageId));
       if (idleChip) {
@@ -674,12 +614,12 @@
     return null;
   }
 
-  function dismissToast(handle) {
-    try { if (handle && window.toastr && window.toastr.clear) window.toastr.clear(handle); } catch (e) { /* ignore */ }
+  function dismissToast(h) {
+    try { if (h && window.toastr && window.toastr.clear) window.toastr.clear(h); } catch (e) { /* ignore */ }
   }
 
   // -------------------------------------------------------------------------
-  // 自动触发（默认关；仅当用户手动打开 enabled 时才生效）
+  // 自动触发（默认关；仅当你手动打开 enabled 时才生效）
   // -------------------------------------------------------------------------
 
   function isAiMessage(ctx, messageId) {
@@ -689,8 +629,8 @@
   }
 
   async function onMessageRendered(messageId) {
-    const settings = loadSettings();
-    if (!settings.enabled) return;      // v3：默认关
+    const s = loadSettings();
+    if (!s.enabled) return;   // 默认关
 
     const ctx = getCtx();
     if (!ctx || !isAiMessage(ctx, messageId)) return;
@@ -727,7 +667,7 @@
 
   function ensurePanel() {
     if (panelEl && panelEl.isConnected) return panelEl;
-    const settings = loadSettings();
+    const s = loadSettings();
 
     panelEl = document.createElement('div');
     panelEl.id = 'so-next-beat-panel';
@@ -739,19 +679,19 @@
       </div>
       <div class="so-nb-panel-body">
         <label class="checkbox_label so-nb-toggle-row">
-          <input type="checkbox" id="so-nb-panel-enabled" ${settings.enabled ? 'checked' : ''}>
+          <input type="checkbox" id="so-nb-panel-enabled" ${s.enabled ? 'checked' : ''}>
           每条新回复自动生成（默认关；手动点更省 API）
         </label>
         <label class="checkbox_label so-nb-toggle-row">
-          <input type="checkbox" id="so-nb-panel-chip" ${settings.showChip ? 'checked' : ''}>
+          <input type="checkbox" id="so-nb-panel-chip" ${s.showChip ? 'checked' : ''}>
           在回复下方显示
         </label>
         <label class="checkbox_label so-nb-toggle-row">
-          <input type="checkbox" id="so-nb-panel-toast" ${settings.showToast ? 'checked' : ''}>
+          <input type="checkbox" id="so-nb-panel-toast" ${s.showToast ? 'checked' : ''}>
           额外用右下角浮窗提示
         </label>
         <label class="checkbox_label so-nb-toggle-row">
-          <input type="checkbox" id="so-nb-panel-float" ${settings.showFloat ? 'checked' : ''}>
+          <input type="checkbox" id="so-nb-panel-float" ${s.showFloat ? 'checked' : ''}>
           悬浮窗常驻（折叠成 🧭 圆标）
         </label>
         <p class="so-nb-panel-label-hint">拖动圆标 / 标题栏可移动；位置会记住。</p>
@@ -766,7 +706,6 @@
     `;
     document.body.appendChild(panelEl);
 
-    // 位置记忆
     (function applyStoredPos() {
       const p = loadPanelPos();
       if (!p) return;
@@ -783,7 +722,6 @@
       panelEl.style.transform = '';
     });
 
-    // 拖动
     (function wireDrag() {
       const handle = panelEl.querySelector('#so-nb-panel-drag-handle');
       let sx = 0, sy = 0, sl = 0, st = 0, pid = null, moved = false;
@@ -831,12 +769,15 @@
     const bindToggle = (id, key) => {
       const el = panelEl.querySelector(id);
       el.addEventListener('change', function () {
-        const s = loadSettings();
-        s[key] = this.checked;
+        const st = loadSettings();
+        st[key] = this.checked;
         saveSettings();
         syncSettingsUI();
         if (key === 'showChip') refreshChips();
-        if (key === 'showFloat') applyFloatVisibility();
+        if (key === 'showFloat') {
+          if (this.checked) floatUserHidden = false;
+          applyFloatVisibility();
+        }
       });
     };
     bindToggle('#so-nb-panel-enabled', 'enabled');
@@ -850,22 +791,15 @@
       let idx = -1;
       for (let i = ctx.chat.length - 1; i >= 0; i--) {
         const m = ctx.chat[i];
-        if (m && !m.is_user && !m.is_system && typeof m.mes === 'string' && m.mes.trim()) {
-          idx = i; break;
-        }
+        if (m && !m.is_user && !m.is_system && typeof m.mes === 'string' && m.mes.trim()) { idx = i; break; }
       }
-      if (idx === -1) { setPanelSuggestion('（找不到可用的 AI 回复）'); return; }
-
+      if (idx === -1) { setPanelSuggestion(null); return; }
       const btn = panelEl.querySelector('#so-nb-panel-regen');
       const old = btn.textContent;
       btn.textContent = '生成中…';
       btn.disabled = true;
-      try {
-        await triggerGenerateForMessage(idx);
-      } finally {
-        btn.textContent = old;
-        btn.disabled = false;
-      }
+      try { await triggerGenerateForMessage(idx); }
+      finally { btn.textContent = old; btn.disabled = false; }
     });
 
     return panelEl;
@@ -880,9 +814,7 @@
       host.textContent = '（暂无）';
       return;
     }
-    host.appendChild(buildOptionsList(options, {
-      onPick: (content) => { fillInput(content); togglePanel(false); },
-    }));
+    host.appendChild(buildOptionsList(options, { onPick: (c) => { fillInput(c); togglePanel(false); } }));
   }
 
   function setPanelBeat(text) {
@@ -897,19 +829,13 @@
     if (entry && Array.isArray(entry.options) && entry.options.length) {
       setPanelSuggestion(entry.options);
       const b = entry.beatInfo;
-      if (b && b.goal) {
-        setPanelBeat(`第 ${b.progress} 拍${b.beatTitle ? ' · ' + b.beatTitle : ''}\n目标：${b.goal}`);
-      } else {
-        setPanelBeat('（未在引导序列中）');
-      }
+      if (b && b.goal) setPanelBeat(`第 ${b.progress} 拍${b.beatTitle ? ' · ' + b.beatTitle : ''}\n目标：${b.goal}`);
+      else setPanelBeat('（未在引导序列中）');
     } else {
       setPanelSuggestion(null);
       const b = getActiveBeatInfo();
-      if (b && b.goal) {
-        setPanelBeat(`第 ${b.progress} 拍${b.beatTitle ? ' · ' + b.beatTitle : ''}\n目标：${b.goal}`);
-      } else {
-        setPanelBeat('（未在引导序列中）');
-      }
+      if (b && b.goal) setPanelBeat(`第 ${b.progress} 拍${b.beatTitle ? ' · ' + b.beatTitle : ''}\n目标：${b.goal}`);
+      else setPanelBeat('（未在引导序列中）');
     }
   }
 
@@ -979,7 +905,7 @@
 
     floatEl.querySelector('#so-nb-float-collapse').addEventListener('click', () => setFloatCollapsed(true));
 
-    // ★ Bug 1 修复：× 只隐藏、不动设置。
+    // ★ × 只做本次隐藏：不动设置里的 showFloat。
     floatEl.querySelector('#so-nb-float-close').addEventListener('click', () => {
       floatUserHidden = true;
       floatEl.classList.add('so-nb-float-hidden');
@@ -1065,27 +991,21 @@
     }
   }
 
-  function setFloatContent(optionsOrText) {
+  function setFloatContent(opts) {
     if (!floatEl) return;
     const host = floatEl.querySelector('#so-nb-float-content');
     if (!host) return;
     host.innerHTML = '';
-    if (Array.isArray(optionsOrText) && optionsOrText.length) {
-      host.appendChild(buildOptionsList(optionsOrText, {
-        onPick: (content) => { fillInput(content); },
-      }));
+    if (Array.isArray(opts) && opts.length) {
+      host.appendChild(buildOptionsList(opts, { onPick: (c) => { fillInput(c); } }));
     } else {
-      host.textContent = typeof optionsOrText === 'string' ? optionsOrText : '（暂无建议）';
+      host.textContent = typeof opts === 'string' ? opts : '（暂无建议）';
     }
   }
 
   function applyFloatVisibility() {
     const s = loadSettings();
-    if (!s.showFloat) {
-      if (floatEl) floatEl.classList.add('so-nb-float-hidden');
-      return;
-    }
-    // ★ Bug 1 修复：「本次隐藏」只挡这一次；用户下次手动改设置 / 打开面板时会清掉。
+    if (!s.showFloat) { if (floatEl) floatEl.classList.add('so-nb-float-hidden'); return; }
     if (floatUserHidden) return;
     const el = ensureFloat();
     el.classList.remove('so-nb-float-hidden');
@@ -1102,7 +1022,7 @@
   function notifyFloatNewOptions(options) {
     const s = loadSettings();
     if (!s.showFloat) return;
-    if (floatUserHidden) return;   // 用户本次隐藏了 → 不打扰
+    if (floatUserHidden) return;
     const el = ensureFloat();
     el.classList.remove('so-nb-float-hidden');
     setFloatContent(options);
@@ -1139,7 +1059,7 @@
       removeAllChips();
       setTimeout(rehangChips, 100);
       updatePanel();
-      floatUserHidden = false;   // 换聊天：把「本次隐藏」清掉
+      floatUserHidden = false;   // 换聊天自动复位
       applyFloatVisibility();
     });
   }
@@ -1154,7 +1074,6 @@
     const menu = document.getElementById('extensionsMenu');
     if (!menu) return false;
     if (document.getElementById(WAND_ID) && menu.contains(document.getElementById(WAND_ID))) return true;
-
     const old = document.getElementById(WAND_ID);
     if (old) old.remove();
 
@@ -1164,7 +1083,7 @@
     item.tabIndex = 0;
     item.innerHTML = '<i class="fa-solid fa-compass"></i><span>下一拍建议</span>';
     item.addEventListener('click', () => {
-      floatUserHidden = false;   // 用户从菜单主动打开 → 解除「本次隐藏」
+      floatUserHidden = false;   // 从菜单主动打开 = 解除本次隐藏
       applyFloatVisibility();
       togglePanel(true);
     });
@@ -1174,9 +1093,7 @@
 
   function watchWandMenu() {
     if (!injectWandButton()) {
-      const mo = new MutationObserver(() => {
-        if (injectWandButton()) mo.disconnect();
-      });
+      const mo = new MutationObserver(() => { if (injectWandButton()) mo.disconnect(); });
       mo.observe(document.body, { childList: true, subtree: true });
       return;
     }
@@ -1249,7 +1166,7 @@
         syncSettingsUI();
         if (key === 'showChip') refreshChips();
         if (key === 'showFloat') {
-          if (this.checked) floatUserHidden = false;   // 用户主动打开 → 清掉「本次隐藏」
+          if (this.checked) floatUserHidden = false;
           applyFloatVisibility();
         }
       });
@@ -1261,7 +1178,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // 等 story-oracle 就绪
+  // 等待 story-oracle
   // -------------------------------------------------------------------------
 
   function waitForStoryOracle(callback) {
