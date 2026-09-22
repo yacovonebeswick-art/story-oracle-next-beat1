@@ -1,59 +1,64 @@
 // ============================================================================
 // 故事神谕 · 下一拍建议（独立插件，不改 story-oracle 任何代码）
-// v2.1.0
+// v3.0.0
 //
 // 功能：
-//   主聊天每收到一条新的 AI 回复后，本插件自动：
+//   在 AI 每写完一条回复后，本插件支持【手动】触发一次建议生成：
 //     1) 通过 story-oracle 的 unsafe.eval 读到「当前正在引导的序列」以及
 //        「当前 active 拍」的 goal（= 玩家接下来要开启的这一拍）；
 //     2) 复用它自己那两个剥离函数（stripMechanismBlocks / stripReasoningTags）
 //        得到干净的正文；
-//     3) 调一次 story-oracle 已配置好的连接（api.run），让模型写出「一句最适合
-//        玩家现在发送、能自然把剧情推进到本拍目标」的指令；
-//     4) 把这句话贴在对应 AI 回复下方（chip）+ 悬浮窗同步显示，点一下即填入
-//        输入框（不自动发送，可编辑）。
+//     3) 调一次 story-oracle 已配置好的连接（api.run），让模型生成 3~6 条
+//        「玩家接下来可以发送的指令」候选，每条带一个主体标签：
+//          [我]      —— 玩家自己（第一人称）
+//          [角色X]   —— 最近正文里在场的其他角色（X 用正文里的称呼）
+//          [时间]    —— 时间推进 / 换场
+//     4) 把候选列表贴在对应 AI 回复下方（chip）+ 悬浮窗同步显示；
+//        点某一行 → 只填【内容】（去掉标签前缀）到输入框；
+//        也可一键填入整段（多行）。
 //
-// v2.1.0 新增：
-//   - 中心面板可拖动（按住标题栏拖）+ 位置记忆 + ⌖ 一键复位
-//   - 面板手机适配：宽度 min(340px, 100vw-16px)、高度 dvh、顶部不贴边
-//   - 悬浮窗（opt-in）：常驻一角，折叠成 🧭 圆标，收到新建议自己冒出来；
-//     可拖动、位置记忆、有未读建议时呼吸光
+// v3.0.0 相对 v2.1.0 的关键变化：
+//   - 生成【默认改为手动触发】（你点才发请求），自动生成的开关保留但默认关；
+//   - 输出从「单条建议」改成「3~6 条候选」，每条带主体标签；
+//   - prompt 明确「紧跟上文，不要凭空跳跃时间/地点」，仅当拍目标暗示换场时才给 [时间]；
+//   - 修复：悬浮窗 × 只隐藏、不再改动「常驻」设置；
+//   - 修复：建议默认不会在你没点「完成」时就生成（用当时的拍）。
 //
-// 关键修复（相对社区版 v1.2.0）：
-//   - maxTokens 从 300 提到 4096 地板（300 会被 reasoning 模型的思考 token 吃光，
-//     输出被截在半句——社区版实测 bug）；
-//   - 用 unsafe.eval 复用 story-oracle 的剥离逻辑，不再自己手写正则；
-//   - 读到 active 拍的 goal 并喂进 prompt，让建议能真正对上「下一拍」；
-//   - 加 AbortController + 240s 超时；
-//   - 加「同一楼只处理一次」的持久去重（存 chat_metadata，刷新后仍认得）；
-//   - 加「最新一条生效」的并发控制；
-//   - 加全量重挂（MESSAGE_SWIPED / MESSAGE_EDITED / MESSAGE_DELETED / CHAT_CHANGED）；
-//   - lastSuggestion 按聊天隔离；
-//   - 魔杖菜单入口改用 MutationObserver 补挂。
+// 依赖：story-oracle 在 1.21.0+ 暴露的 window.StoryOracleAPI（及 story-oracle-ready 事件）。
 // ============================================================================
 
 (function () {
   'use strict';
 
   const MODULE_ID = 'story-oracle-next-beat';
-  const VERSION = '2.1.0';
+  const VERSION = '3.0.0';
 
   const DEFAULTS = {
-    enabled: true,          // 每条新回复自动生成建议
+    enabled: false,         // v3：自动生成默认【关】——改为手动触发省 API
     showChip: true,         // 在回复下方显示 chip
-    showToast: false,       // 右下角 toast（默认关）
-    showFloat: false,       // 悬浮窗（默认关，opt-in）
+    showToast: false,       // 右下角 toast
+    showFloat: false,       // 悬浮窗
+    autoHideChipOnNew: true,// 生成新候选时清掉旧 chip（同一楼只留一份）
   };
 
   const MIN_OUTPUT_TOKENS = 4096;      // reasoning 模型思考也吃 max_tokens
-  const REQUEST_TIMEOUT_MS = 240000;   // 与 story-oracle 本体一致
+  const REQUEST_TIMEOUT_MS = 240000;
   const MIN_NARRATIVE_LEN = 10;
 
   const DONE_META_KEY = MODULE_ID + '_done';
   const DONE_KEEP_MAX = 400;
 
-  let lastByChat = {};                 // { [chatKey]: { suggestion, beatInfo, messageId, at } }
+  // 三类主体标签（固定槽位；角色槽位由模型用正文里的称呼替换）
+  const LBL_USER = '我';
+  const LBL_TIME = '时间';
+  const ROLE_SLOT_RE = /^角色[ABC]$/;  // 未被替换的槽位名，仍照常显示
+
+  let lastByChat = {};                 // { [chatKey]: { options, beatInfo, messageId, at } }
   let panelEl = null;
+  let floatEl = null;
+  let floatCollapsed = true;
+  let floatFresh = false;
+  let floatUserHidden = false;         // 会话级：× 掉悬浮窗只置这个，不动设置
   let currentAbort = null;
   let lastRequestKey = null;
 
@@ -137,10 +142,6 @@
     }
   }
 
-  // -------------------------------------------------------------------------
-  // 复用 story-oracle 的剥离逻辑
-  // -------------------------------------------------------------------------
-
   function cleanNarrative(raw) {
     const text = String(raw == null ? '' : raw);
     if (!text) return '';
@@ -154,10 +155,6 @@
     );
     return String(cleaned == null ? text : cleaned);
   }
-
-  // -------------------------------------------------------------------------
-  // 读序列状态
-  // -------------------------------------------------------------------------
 
   function getActiveBeatInfo() {
     const seq = apiSafeEval(
@@ -188,16 +185,37 @@
   // -------------------------------------------------------------------------
 
   const SYSTEM_PROMPT =
-    '你是一个为角色扮演游戏生成「玩家下一步指令」的助手。' +
+    '你是一个为角色扮演游戏生成「玩家下一步可发送指令」候选的助手。' +
     '用户会给你：当前剧情的最后一段正文，以及（如果有）当前正在引导的剧情序列中的某一拍目标。' +
-    '你只输出【一句话】——玩家接下来最适合发送给 AI 的指令。' +
-    '要求：' +
-    '1) 用第一人称「我」；' +
-    '2) 具体到可以立刻发送（带时间 / 地点 / 动作 / 台词中的一两样）；' +
-    '3) 若给了拍目标，这句话必须能把剧情自然推向那个目标；' +
-    '4) 不要复述或评论正文；' +
-    '5) 不要加引号、不要编号、不要任何前后缀说明；' +
-    '6) 只说这一句话本身。';
+    '你需要生成 3~6 条候选，每条都能作为「玩家」接下来直接发送给 AI 的指令。' +
+    '输出格式（严格遵守）：每条一行，行首固定为「**标签** 」加一个空格，然后接具体内容。' +
+    '标签只允许以下三类：' +
+    '  1) **我**      —— 玩家自己（第一人称「我」）的动作/台词；' +
+    '  2) **角色X**   —— 最近正文里【在场的其他角色】的动作/台词，' +
+    'X 用正文里对这个人物的称呼替换（例如「胡一菲」）；' +
+    '若模型无法确定具体是谁，则保留 **角色A** / **角色B** / **角色C**；' +
+    '不要凭空发明正文里没出现过的人物。' +
+    '  3) **时间**    —— 时间推进 / 换场；只有当下述条件满足时才用。' +
+    '内容要求：' +
+    '  · 每条 1~2 句，具体到可以立刻发送（带动作/台词/场景细节之一）；' +
+    '  · 【紧跟上文】：不要凭空跳跃时间或地点；上一句若是对话/问句，' +
+    '    大部分候选应当是【立即】的回应或行动，而不是「几小时后……」。' +
+    '  · 前 3 条必须是 **我**（三个不同角度的合理应对：直接回应 / 另一角度 / 更主动的做法）。' +
+    '  · 若最近正文里有其他在场角色，则第 4~5 条使用 **角色X**（不同角色，' +
+    '    或同一角色的两个不同角度）。若最近正文里只有「我」和叙述、没有别的角色，' +
+    '    则省略 4~5，只给 3 条 **我**。' +
+    '  · 只有当【本拍目标】明确暗示需要换场/换时间（例如目标里含「次日」「翌日」' +
+    '    「数日后」「转场」「到了……」等）时，才在最后追加一条 **时间** 选项；' +
+    '    否则不给 **时间** 选项。' +
+    '  · 行内不要出现 MBTI 分析、不要出现「（动作）」这类标注、不要引号外的解释。' +
+    '  · 不要使用 Markdown 列表符号（- / *），只用上面规定的「**标签** 内容」格式。' +
+    '示例（仅示范格式；实际人物/场景由你根据正文判断）：' +
+    '**我** 我站起身，走到门口把帘子拉下。\n' +
+    '**我** 我把杯子里的水一口喝掉，沉默了两秒。\n' +
+    '**我** 我回头看了一眼，低声说：「我们换个地方谈。」\n' +
+    '**角色A** 他靠在墙边，抱着胳膊没说话。\n' +
+    '**角色B** 她放下手里的笔，抬头看向我。\n' +
+    '**时间** 半小时后，天色完全暗了下来。';
 
   function buildUserPrompt(narrativeText, beatInfo) {
     const parts = [];
@@ -209,33 +227,61 @@
       if (beatInfo.seed) parts.push('本拍起始迹象：' + beatInfo.seed);
       if (beatInfo.why) parts.push('为什么这样安排：' + beatInfo.why);
       parts.push('');
-      parts.push('【刚写完的正文（仅供参考，不要复述）】');
-      parts.push('"""');
-      parts.push(narrativeText.slice(-4000));
-      parts.push('"""');
-      parts.push('');
-      parts.push('请输出一句「玩家」接下来要发送给 AI 的指令，' +
-        '必须能把剧情自然推向上面那个【本拍目标】，' +
-        '风格参考：「到了5月26日早晨，第一食堂的空气有些凝重，我端着茶缸，走进了杨厂长的会议室。」' +
-        '只输出这一句话本身。');
+    }
+    parts.push('【刚写完的正文（仅供参考，不要复述）】');
+    parts.push('"""');
+    parts.push(narrativeText.slice(-4000));
+    parts.push('"""');
+    parts.push('');
+    if (beatInfo && beatInfo.goal) {
+      parts.push('请按系统提示规定的格式，生成 3~6 条候选。' +
+        '所有候选的最终目标，都要能自然把剧情推向上面那个【本拍目标】；' +
+        '其中至少一条应当是【紧接着上一句正文】的即时回应/行动，' +
+        '不要一上来就跨时间。');
     } else {
-      parts.push('【刚写完的正文（仅供参考，不要复述）】');
-      parts.push('"""');
-      parts.push(narrativeText.slice(-4000));
-      parts.push('"""');
-      parts.push('');
-      parts.push('请输出一句「玩家」接下来最适合发送给 AI 的指令，' +
-        '要能让剧情顺着刚才这段正文自然过渡到下一步。' +
-        '只输出这一句话本身。');
+      parts.push('请按系统提示规定的格式，生成 3~6 条候选。' +
+        '所有候选都要能顺着刚才这段正文自然展开下一步；' +
+        '其中至少一条应当是【紧接着上一句正文】的即时回应/行动。');
     }
     return parts.join('\n');
   }
 
   // -------------------------------------------------------------------------
-  // 调 API
+  // 调 API（返回结构化候选数组）
   // -------------------------------------------------------------------------
+  // 返回：[{ label, content, raw }] 或 null
+  //   · label   渲染用标签（"我" / "角色X" / "时间"）；角色槽位未替换时保留 "角色A" 等
+  //   · content 去掉标签前缀后的正文，点行时填这个
+  //   · raw     完整原始行（保底/调试用）
 
-  async function requestNextBeatOption(narrativeText, beatInfo) {
+  function parseOptions(text) {
+    const src = String(text || '');
+    const out = [];
+    const lines = src.split(/\r?\n/);
+    // 匹配 「**标签** 内容」
+    const re = /^\s*\*\*([^*\n]+?)\*\*\s+(.+?)\s*$/;
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const m = line.match(re);
+      if (!m) continue;
+      const label = m[1].trim();
+      const content = m[2].trim();
+      if (!label || !content) continue;
+      out.push({ label, content, raw: line.trim() });
+    }
+    // 去重（同一标签 + 同一内容）
+    const seen = new Set();
+    const dedup = [];
+    for (const o of out) {
+      const k = o.label + '\u0001' + o.content;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      dedup.push(o);
+    }
+    return dedup.length ? dedup : null;
+  }
+
+  async function requestNextBeatOptions(narrativeText, beatInfo) {
     const api = window.StoryOracleAPI;
     if (!api || typeof api.run !== 'function') {
       console.warn('[next-beat] StoryOracleAPI.run 不可用，跳过');
@@ -275,8 +321,7 @@
         text = result.text || result.content || result.reply || '';
       }
       text = String(text || '').trim();
-      text = text.replace(/^["“'「『]+/, '').replace(/["”'」』]+$/, '').trim();
-      return text || null;
+      return parseOptions(text);
     } catch (err) {
       if (err && err.name === 'AbortError') return null;
       console.error('[next-beat] 调用失败：', err);
@@ -301,6 +346,47 @@
   }
 
   // -------------------------------------------------------------------------
+  // 通用：候选列表渲染（chip / 悬浮窗 / 面板共用）
+  // -------------------------------------------------------------------------
+
+  function labelClass(label) {
+    if (label === LBL_USER) return 'so-nb-lbl-user';
+    if (label === LBL_TIME) return 'so-nb-lbl-time';
+    return 'so-nb-lbl-role';
+  }
+
+  // 生成一块候选列表 DOM；onPick(content) 在点某一行时调用
+  function buildOptionsList(options, opts) {
+    const list = document.createElement('div');
+    list.className = 'so-nb-options';
+    if (!Array.isArray(options) || !options.length) {
+      const empty = document.createElement('div');
+      empty.className = 'so-nb-empty';
+      empty.textContent = '（暂无候选）';
+      list.appendChild(empty);
+      return list;
+    }
+    for (const o of options) {
+      const row = document.createElement('div');
+      row.className = 'so-nb-option-row';
+      row.title = '点一下：把这一条填入输入框';
+      const tag = document.createElement('span');
+      tag.className = 'so-nb-option-tag ' + labelClass(o.label);
+      tag.textContent = '[' + o.label + ']';
+      const txt = document.createElement('span');
+      txt.className = 'so-nb-option-text';
+      txt.textContent = o.content;
+      row.appendChild(tag);
+      row.appendChild(txt);
+      row.addEventListener('click', () => {
+        if (typeof opts?.onPick === 'function') opts.onPick(o.content);
+      });
+      list.appendChild(row);
+    }
+    return list;
+  }
+
+  // -------------------------------------------------------------------------
   // Chip（贴在 AI 回复下方）
   // -------------------------------------------------------------------------
 
@@ -315,7 +401,53 @@
     document.querySelectorAll('.so-next-beat-chip').forEach((el) => el.remove());
   }
 
-  function renderChip(messageId, suggestionText, beatInfo) {
+  // 未生成 → 显示「生成建议」按钮
+  function renderChipIdle(messageId, beatInfo) {
+    const settings = loadSettings();
+    if (!settings.showChip) return;
+    const $mes = document.querySelector('.mes[mesid="' + messageId + '"]');
+    if (!$mes) return;
+
+    removeChip(messageId);
+
+    const chip = document.createElement('div');
+    chip.id = chipIdFor(messageId);
+    chip.className = 'so-next-beat-chip so-next-beat-chip-idle';
+
+    const label = document.createElement('span');
+    label.className = 'so-next-beat-chip-label';
+    label.textContent = beatInfo && beatInfo.goal
+      ? `🧭 下一拍建议 · 第 ${beatInfo.progress} 拍`
+      : '🧭 下一拍建议';
+    chip.appendChild(label);
+
+    if (beatInfo && beatInfo.goal) {
+      const goalLine = document.createElement('div');
+      goalLine.className = 'so-next-beat-chip-goal';
+      goalLine.textContent = '目标：' + beatInfo.goal;
+      chip.appendChild(goalLine);
+    }
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'so-next-beat-chip-btn';
+    btn.textContent = '生成建议';
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      triggerGenerateForMessage(messageId);
+    });
+    chip.appendChild(btn);
+
+    const anchor = $mes.querySelector('.mes_text');
+    if (anchor && anchor.parentNode) {
+      anchor.parentNode.insertBefore(chip, anchor.nextSibling);
+    } else {
+      $mes.appendChild(chip);
+    }
+  }
+
+  // 已生成 → 显示候选列表 + 重新生成按钮
+  function renderChipWithOptions(messageId, options, beatInfo) {
     const settings = loadSettings();
     if (!settings.showChip) return;
     const $mes = document.querySelector('.mes[mesid="' + messageId + '"]');
@@ -326,7 +458,6 @@
     const chip = document.createElement('div');
     chip.id = chipIdFor(messageId);
     chip.className = 'so-next-beat-chip';
-    chip.title = '点一下：填入输入框（可编辑后再发送）';
 
     const label = document.createElement('span');
     label.className = 'so-next-beat-chip-label';
@@ -335,16 +466,43 @@
       : '🧭 下一拍建议';
     chip.appendChild(label);
 
-    const textEl = document.createElement('span');
-    textEl.className = 'so-next-beat-chip-text';
-    textEl.textContent = suggestionText;
-    chip.appendChild(textEl);
+    if (beatInfo && beatInfo.goal) {
+      const goalLine = document.createElement('div');
+      goalLine.className = 'so-next-beat-chip-goal';
+      goalLine.textContent = '目标：' + beatInfo.goal;
+      chip.appendChild(goalLine);
+    }
 
-    chip.addEventListener('click', () => {
-      if (fillInput(suggestionText)) {
-        chip.classList.add('so-next-beat-chip-used');
-      }
+    chip.appendChild(buildOptionsList(options, {
+      onPick: (content) => { fillInput(content); },
+    }));
+
+    const foot = document.createElement('div');
+    foot.className = 'so-next-beat-chip-foot';
+
+    const regen = document.createElement('button');
+    regen.type = 'button';
+    regen.className = 'so-next-beat-chip-btn so-next-beat-chip-btn-minor';
+    regen.textContent = '重新生成';
+    regen.addEventListener('click', (e) => {
+      e.stopPropagation();
+      triggerGenerateForMessage(messageId);
     });
+    foot.appendChild(regen);
+
+    const fillAll = document.createElement('button');
+    fillAll.type = 'button';
+    fillAll.className = 'so-next-beat-chip-btn so-next-beat-chip-btn-minor';
+    fillAll.textContent = '填入整段';
+    fillAll.title = '把全部候选按行填入输入框';
+    fillAll.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const all = options.map((o) => '[' + o.label + '] ' + o.content).join('\n');
+      fillInput(all);
+    });
+    foot.appendChild(fillAll);
+
+    chip.appendChild(foot);
 
     const anchor = $mes.querySelector('.mes_text');
     if (anchor && anchor.parentNode) {
@@ -355,14 +513,17 @@
   }
 
   // -------------------------------------------------------------------------
-  // 全量重挂 chip
+  // 全量重挂
   // -------------------------------------------------------------------------
 
   function rehangChips() {
     const key = chatKey();
     const entry = lastByChat[key];
-    if (!entry || !entry.suggestion || entry.messageId == null) return;
-    renderChip(entry.messageId, entry.suggestion, entry.beatInfo || null);
+    if (!entry || entry.messageId == null) return;
+    // 只在【最新一条被生成过】的那一楼里重挂；未生成过的不显示空 chip
+    if (Array.isArray(entry.options) && entry.options.length) {
+      renderChipWithOptions(entry.messageId, entry.options, entry.beatInfo || null);
+    }
   }
 
   function refreshChips() {
@@ -389,7 +550,7 @@
     if (el) el.classList.remove('so-next-beat-show');
   }
 
-  function showSuggestionToast(suggestionText) {
+  function showSuggestionToast(options) {
     const settings = loadSettings();
     if (!settings.showToast) return;
     const el = ensureToastContainer();
@@ -400,19 +561,12 @@
     label.textContent = '🧭 下一拍建议';
     el.appendChild(label);
 
-    const body = document.createElement('div');
-    body.className = 'so-next-beat-body';
-    body.textContent = suggestionText;
-    el.appendChild(body);
+    el.appendChild(buildOptionsList(options, {
+      onPick: (content) => { fillInput(content); hideSuggestionToast(); },
+    }));
 
     const row = document.createElement('div');
     row.className = 'so-next-beat-row';
-
-    const useBtn = document.createElement('button');
-    useBtn.type = 'button';
-    useBtn.className = 'so-next-beat-btn so-next-beat-use';
-    useBtn.textContent = '使用';
-    useBtn.addEventListener('click', () => { fillInput(suggestionText); hideSuggestionToast(); });
 
     const closeBtn = document.createElement('button');
     closeBtn.type = 'button';
@@ -420,14 +574,13 @@
     closeBtn.textContent = '×';
     closeBtn.addEventListener('click', hideSuggestionToast);
 
-    row.appendChild(useBtn);
     row.appendChild(closeBtn);
     el.appendChild(row);
     el.classList.add('so-next-beat-show');
   }
 
   // -------------------------------------------------------------------------
-  // lastSuggestion（按聊天隔离）
+  // lastByChat
   // -------------------------------------------------------------------------
 
   function setLast(entry) {
@@ -443,6 +596,111 @@
 
   function getLast() {
     return lastByChat[chatKey()] || null;
+  }
+
+  // -------------------------------------------------------------------------
+  // 触发（手动 / 自动都走这里）
+  // -------------------------------------------------------------------------
+
+  async function generateOptionsForMessage(messageId) {
+    const ctx = getCtx();
+    if (!ctx || !ctx.chat) return null;
+    const m = ctx.chat[messageId];
+    if (!m || m.is_user || m.is_system) return null;
+    if (typeof m.mes !== 'string' || m.mes.trim().length < MIN_NARRATIVE_LEN) return null;
+
+    const narrative = cleanNarrative(m.mes);
+    if (!narrative || narrative.length < MIN_NARRATIVE_LEN) return null;
+
+    const beatInfo = getActiveBeatInfo();
+    const options = await requestNextBeatOptions(narrative, beatInfo);
+    return { options, beatInfo, messageId };
+  }
+
+  async function triggerGenerateForMessage(messageId) {
+    const ctx = getCtx();
+    if (!ctx || !ctx.chat) return;
+    const m = ctx.chat[messageId];
+    if (!m || m.is_user || m.is_system) return;
+
+    // 生成中：先把 chip 切成「生成中…」
+    const chip = document.getElementById(chipIdFor(messageId));
+    if (chip) {
+      const btn = chip.querySelector('.so-next-beat-chip-btn');
+      if (btn) { btn.disabled = true; btn.textContent = '生成中…'; }
+    }
+    const busyToast = showBusyToast();
+
+    const myKey = chatKey() + ':' + messageId + ':' + ((m.swipe_id || 0));
+    lastRequestKey = myKey;
+
+    let out = null;
+    try {
+      out = await generateOptionsForMessage(messageId);
+    } finally {
+      dismissToast(busyToast);
+    }
+
+    if (lastRequestKey !== myKey) return;
+    const cur = ctx.chat[messageId];
+    if (!cur || ((cur.swipe_id || 0) !== (m.swipe_id || 0))) return;
+
+    if (!out || !out.options || !out.options.length) {
+      // 失败：把 chip 变回「生成建议」按钮 + 友好提示
+      renderChipIdle(messageId, getActiveBeatInfo());
+      const idleChip = document.getElementById(chipIdFor(messageId));
+      if (idleChip) {
+        const tip = document.createElement('div');
+        tip.className = 'so-next-beat-chip-err';
+        tip.textContent = '（这次没能生成，看看控制台）';
+        idleChip.appendChild(tip);
+      }
+      return;
+    }
+
+    setLast({ options: out.options, beatInfo: out.beatInfo, messageId });
+    renderChipWithOptions(messageId, out.options, out.beatInfo);
+    showSuggestionToast(out.options);
+    notifyFloatNewOptions(out.options);
+    markDone(myKey);
+  }
+
+  function showBusyToast() {
+    try {
+      if (window.toastr && window.toastr.info) {
+        return window.toastr.info('正在生成候选…', '🧭 下一拍建议', { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false });
+      }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+
+  function dismissToast(handle) {
+    try { if (handle && window.toastr && window.toastr.clear) window.toastr.clear(handle); } catch (e) { /* ignore */ }
+  }
+
+  // -------------------------------------------------------------------------
+  // 自动触发（默认关；仅当用户手动打开 enabled 时才生效）
+  // -------------------------------------------------------------------------
+
+  function isAiMessage(ctx, messageId) {
+    const m = ctx && ctx.chat && ctx.chat[messageId];
+    if (!m || m.is_user || m.is_system) return false;
+    return typeof m.mes === 'string' && m.mes.trim().length > 0;
+  }
+
+  async function onMessageRendered(messageId) {
+    const settings = loadSettings();
+    if (!settings.enabled) return;      // v3：默认关
+
+    const ctx = getCtx();
+    if (!ctx || !isAiMessage(ctx, messageId)) return;
+
+    const m = ctx.chat[messageId];
+    const swipeId = m.swipe_id || 0;
+    const key = `${chatKey()}:${messageId}:${swipeId}`;
+    if (isDone(key)) return;
+
+    await triggerGenerateForMessage(messageId);
   }
 
   // -------------------------------------------------------------------------
@@ -482,11 +740,11 @@
       <div class="so-nb-panel-body">
         <label class="checkbox_label so-nb-toggle-row">
           <input type="checkbox" id="so-nb-panel-enabled" ${settings.enabled ? 'checked' : ''}>
-          正文生成后自动生成建议
+          每条新回复自动生成（默认关；手动点更省 API）
         </label>
         <label class="checkbox_label so-nb-toggle-row">
           <input type="checkbox" id="so-nb-panel-chip" ${settings.showChip ? 'checked' : ''}>
-          在回复下方显示建议
+          在回复下方显示
         </label>
         <label class="checkbox_label so-nb-toggle-row">
           <input type="checkbox" id="so-nb-panel-toast" ${settings.showToast ? 'checked' : ''}>
@@ -494,7 +752,7 @@
         </label>
         <label class="checkbox_label so-nb-toggle-row">
           <input type="checkbox" id="so-nb-panel-float" ${settings.showFloat ? 'checked' : ''}>
-          悬浮窗常驻（折叠成 🧭 圆标，收到新建议自己冒出来）
+          悬浮窗常驻（折叠成 🧭 圆标）
         </label>
         <p class="so-nb-panel-label-hint">拖动圆标 / 标题栏可移动；位置会记住。</p>
         <div class="so-nb-panel-label">当前拍：</div>
@@ -502,14 +760,13 @@
         <div class="so-nb-panel-label">最近一次建议：</div>
         <div class="so-nb-panel-suggestion" id="so-nb-panel-suggestion">（暂无）</div>
         <div class="so-nb-panel-row">
-          <button type="button" id="so-nb-panel-use" class="so-next-beat-btn so-next-beat-use">使用这句</button>
-          <button type="button" id="so-nb-panel-regen" class="so-next-beat-btn">针对最新回复生成</button>
+          <button type="button" id="so-nb-panel-regen" class="so-next-beat-btn so-next-beat-use">针对最新回复生成</button>
         </div>
       </div>
     `;
     document.body.appendChild(panelEl);
 
-    // —— 位置记忆 ——
+    // 位置记忆
     (function applyStoredPos() {
       const p = loadPanelPos();
       if (!p) return;
@@ -518,7 +775,6 @@
       panelEl.style.transform = 'scale(0.96)';
     })();
 
-    // —— 重置位置 ——
     panelEl.querySelector('#so-nb-panel-reset').addEventListener('click', (e) => {
       e.stopPropagation();
       clearPanelPos();
@@ -527,7 +783,7 @@
       panelEl.style.transform = '';
     });
 
-    // —— 拖动 ——
+    // 拖动
     (function wireDrag() {
       const handle = panelEl.querySelector('#so-nb-panel-drag-handle');
       let sx = 0, sy = 0, sl = 0, st = 0, pid = null, moved = false;
@@ -564,16 +820,12 @@
         if (moved) {
           const r = panelEl.getBoundingClientRect();
           savePanelPos(Math.round(r.left), Math.round(r.top));
-          const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
-          panelEl.addEventListener('click', swallow, { capture: true, once: true });
-          setTimeout(() => panelEl.removeEventListener('click', swallow, { capture: true }), 300);
         }
       };
       handle.addEventListener('pointerup', end);
       handle.addEventListener('pointercancel', end);
     })();
 
-    // —— 关闭 / 开关 ——
     panelEl.querySelector('.so-nb-panel-close').addEventListener('click', () => togglePanel(false));
 
     const bindToggle = (id, key) => {
@@ -592,16 +844,6 @@
     bindToggle('#so-nb-panel-toast', 'showToast');
     bindToggle('#so-nb-panel-float', 'showFloat');
 
-    panelEl.querySelector('#so-nb-panel-use').addEventListener('click', () => {
-      const entry = getLast();
-      if (entry && entry.suggestion) {
-        fillInput(entry.suggestion);
-        togglePanel(false);
-      } else {
-        setPanelSuggestion('（还没有建议——等一条新的正文回复，或点右边「针对最新回复生成」）');
-      }
-    });
-
     panelEl.querySelector('#so-nb-panel-regen').addEventListener('click', async () => {
       const ctx = getCtx();
       if (!ctx || !ctx.chat || !ctx.chat.length) return;
@@ -619,22 +861,7 @@
       btn.textContent = '生成中…';
       btn.disabled = true;
       try {
-        const m = ctx.chat[idx];
-        const narrative = cleanNarrative(m.mes);
-        if (!narrative || narrative.length < MIN_NARRATIVE_LEN) {
-          setPanelSuggestion('（这条回复没有可用的正文）');
-          return;
-        }
-        const beatInfo = getActiveBeatInfo();
-        const suggestion = await requestNextBeatOption(narrative, beatInfo);
-        if (suggestion) {
-          setLast({ suggestion, beatInfo, messageId: idx });
-          renderChip(idx, suggestion, beatInfo);
-          showSuggestionToast(suggestion);
-          notifyFloatNewSuggestion(suggestion);
-        } else {
-          setPanelSuggestion('（这次没能生成，看看浏览器控制台）');
-        }
+        await triggerGenerateForMessage(idx);
       } finally {
         btn.textContent = old;
         btn.disabled = false;
@@ -644,10 +871,18 @@
     return panelEl;
   }
 
-  function setPanelSuggestion(text) {
+  function setPanelSuggestion(options) {
     if (!panelEl || !panelEl.isConnected) return;
-    const el = panelEl.querySelector('#so-nb-panel-suggestion');
-    if (el) el.textContent = text;
+    const host = panelEl.querySelector('#so-nb-panel-suggestion');
+    if (!host) return;
+    host.innerHTML = '';
+    if (!Array.isArray(options) || !options.length) {
+      host.textContent = '（暂无）';
+      return;
+    }
+    host.appendChild(buildOptionsList(options, {
+      onPick: (content) => { fillInput(content); togglePanel(false); },
+    }));
   }
 
   function setPanelBeat(text) {
@@ -659,8 +894,8 @@
   function updatePanel() {
     if (!panelEl || !panelEl.isConnected) return;
     const entry = getLast();
-    if (entry && entry.suggestion) {
-      setPanelSuggestion(entry.suggestion);
+    if (entry && Array.isArray(entry.options) && entry.options.length) {
+      setPanelSuggestion(entry.options);
       const b = entry.beatInfo;
       if (b && b.goal) {
         setPanelBeat(`第 ${b.progress} 拍${b.beatTitle ? ' · ' + b.beatTitle : ''}\n目标：${b.goal}`);
@@ -668,7 +903,7 @@
         setPanelBeat('（未在引导序列中）');
       }
     } else {
-      setPanelSuggestion('（暂无）');
+      setPanelSuggestion(null);
       const b = getActiveBeatInfo();
       if (b && b.goal) {
         setPanelBeat(`第 ${b.progress} 拍${b.beatTitle ? ' · ' + b.beatTitle : ''}\n目标：${b.goal}`);
@@ -686,14 +921,11 @@
   }
 
   // -------------------------------------------------------------------------
-  // 悬浮窗（v2.1.0）
+  // 悬浮窗
   // -------------------------------------------------------------------------
 
   const FLOAT_ID = 'so-nb-float';
   const FLOAT_POS_KEY = MODULE_ID + '_float_pos';
-  let floatEl = null;
-  let floatCollapsed = true;
-  let floatFresh = false;
 
   function loadFloatPos() {
     try {
@@ -720,12 +952,11 @@
         <div class="so-nb-float-head" id="so-nb-float-drag-handle">
           <span class="so-nb-float-title">🧭 下一拍建议</span>
           <span class="so-nb-float-icon-btn" id="so-nb-float-collapse" title="折叠">—</span>
-          <span class="so-nb-float-icon-btn" id="so-nb-float-close" title="关闭悬浮窗">×</span>
+          <span class="so-nb-float-icon-btn" id="so-nb-float-close" title="本次隐藏（不影响设置里的常驻）">×</span>
         </div>
         <div class="so-nb-float-content" id="so-nb-float-content">（暂无建议）</div>
         <div class="so-nb-float-actions">
-          <button type="button" class="so-next-beat-btn so-next-beat-use" id="so-nb-float-use">使用这句</button>
-          <button type="button" class="so-next-beat-btn" id="so-nb-float-regen">重生成</button>
+          <button type="button" class="so-next-beat-btn so-next-beat-use" id="so-nb-float-regen">生成 / 重新生成</button>
         </div>
       </div>
     `;
@@ -747,15 +978,11 @@
     });
 
     floatEl.querySelector('#so-nb-float-collapse').addEventListener('click', () => setFloatCollapsed(true));
-    floatEl.querySelector('#so-nb-float-close').addEventListener('click', () => setFloatVisible(false));
 
-    floatEl.querySelector('#so-nb-float-use').addEventListener('click', () => {
-      const entry = getLast();
-      if (entry && entry.suggestion) {
-        fillInput(entry.suggestion);
-      } else {
-        setFloatContent('（还没有建议——等一条新的正文回复，或点「重生成」）');
-      }
+    // ★ Bug 1 修复：× 只隐藏、不动设置。
+    floatEl.querySelector('#so-nb-float-close').addEventListener('click', () => {
+      floatUserHidden = true;
+      floatEl.classList.add('so-nb-float-hidden');
     });
 
     floatEl.querySelector('#so-nb-float-regen').addEventListener('click', async () => {
@@ -772,18 +999,7 @@
           if (m && !m.is_user && !m.is_system && typeof m.mes === 'string' && m.mes.trim()) { idx = i; break; }
         }
         if (idx === -1) { setFloatContent('（找不到可用的 AI 回复）'); return; }
-        const narrative = cleanNarrative(ctx.chat[idx].mes);
-        if (!narrative || narrative.length < MIN_NARRATIVE_LEN) { setFloatContent('（这条回复没有可用的正文）'); return; }
-        const beatInfo = getActiveBeatInfo();
-        const suggestion = await requestNextBeatOption(narrative, beatInfo);
-        if (suggestion) {
-          setLast({ suggestion, beatInfo, messageId: idx });
-          renderChip(idx, suggestion, beatInfo);
-          showSuggestionToast(suggestion);
-          setFloatContent(suggestion);
-        } else {
-          setFloatContent('（这次没能生成，看看浏览器控制台）');
-        }
+        await triggerGenerateForMessage(idx);
       } finally {
         btn.textContent = old;
         btn.disabled = false;
@@ -830,9 +1046,6 @@
         if (moved) {
           const r = floatEl.getBoundingClientRect();
           saveFloatPos(Math.round(r.left), Math.round(r.top));
-          const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
-          floatEl.addEventListener('click', swallow, { capture: true, once: true });
-          setTimeout(() => floatEl.removeEventListener('click', swallow, { capture: true }), 300);
         }
       };
       el.addEventListener('pointerup', end);
@@ -852,18 +1065,18 @@
     }
   }
 
-  function setFloatContent(text) {
+  function setFloatContent(optionsOrText) {
     if (!floatEl) return;
-    const el = floatEl.querySelector('#so-nb-float-content');
-    if (el) el.textContent = text || '（暂无建议）';
-  }
-
-  function setFloatVisible(on) {
-    const s = loadSettings();
-    s.showFloat = !!on;
-    saveSettings();
-    syncSettingsUI();
-    applyFloatVisibility();
+    const host = floatEl.querySelector('#so-nb-float-content');
+    if (!host) return;
+    host.innerHTML = '';
+    if (Array.isArray(optionsOrText) && optionsOrText.length) {
+      host.appendChild(buildOptionsList(optionsOrText, {
+        onPick: (content) => { fillInput(content); },
+      }));
+    } else {
+      host.textContent = typeof optionsOrText === 'string' ? optionsOrText : '（暂无建议）';
+    }
   }
 
   function applyFloatVisibility() {
@@ -872,24 +1085,27 @@
       if (floatEl) floatEl.classList.add('so-nb-float-hidden');
       return;
     }
+    // ★ Bug 1 修复：「本次隐藏」只挡这一次；用户下次手动改设置 / 打开面板时会清掉。
+    if (floatUserHidden) return;
     const el = ensureFloat();
     el.classList.remove('so-nb-float-hidden');
     const entry = getLast();
-    if (entry && entry.suggestion) {
-      setFloatContent(entry.suggestion);
+    if (entry && Array.isArray(entry.options) && entry.options.length) {
+      setFloatContent(entry.options);
       setFloatCollapsed(false);
     } else {
-      setFloatContent('（暂无建议）');
+      setFloatContent('（暂无建议，点上面「生成 / 重新生成」）');
       setFloatCollapsed(true);
     }
   }
 
-  function notifyFloatNewSuggestion(suggestion) {
+  function notifyFloatNewOptions(options) {
     const s = loadSettings();
     if (!s.showFloat) return;
+    if (floatUserHidden) return;   // 用户本次隐藏了 → 不打扰
     const el = ensureFloat();
     el.classList.remove('so-nb-float-hidden');
-    setFloatContent(suggestion);
+    setFloatContent(options);
     if (floatCollapsed) {
       floatFresh = true;
       el.classList.add('so-nb-float-fresh');
@@ -897,51 +1113,6 @@
       floatFresh = false;
       el.classList.remove('so-nb-float-fresh');
     }
-  }
-
-  // -------------------------------------------------------------------------
-  // 触发：每条新的 AI 回复
-  // -------------------------------------------------------------------------
-
-  function isAiMessage(ctx, messageId) {
-    const m = ctx && ctx.chat && ctx.chat[messageId];
-    if (!m || m.is_user || m.is_system) return false;
-    return typeof m.mes === 'string' && m.mes.trim().length > 0;
-  }
-
-  async function onMessageRendered(messageId) {
-    const settings = loadSettings();
-    if (!settings.enabled) return;
-
-    const ctx = getCtx();
-    if (!ctx || !isAiMessage(ctx, messageId)) return;
-
-    const m = ctx.chat[messageId];
-    const swipeId = m.swipe_id || 0;
-    const key = `${chatKey()}:${messageId}:${swipeId}`;
-
-    if (isDone(key)) return;
-
-    const narrative = cleanNarrative(m.mes);
-    if (!narrative || narrative.length < MIN_NARRATIVE_LEN) return;
-
-    markDone(key);
-
-    const beatInfo = getActiveBeatInfo();
-    const myKey = key;
-    lastRequestKey = myKey;
-
-    const suggestion = await requestNextBeatOption(narrative, beatInfo);
-
-    if (lastRequestKey !== myKey) return;
-    if (!suggestion) return;
-    const cur = ctx.chat[messageId];
-    if (!cur || ((cur.swipe_id || 0) !== swipeId)) return;
-
-    setLast({ suggestion, beatInfo, messageId });
-    renderChip(messageId, suggestion, beatInfo);
-    showSuggestionToast(suggestion);
-    notifyFloatNewSuggestion(suggestion);
   }
 
   // -------------------------------------------------------------------------
@@ -968,12 +1139,13 @@
       removeAllChips();
       setTimeout(rehangChips, 100);
       updatePanel();
+      floatUserHidden = false;   // 换聊天：把「本次隐藏」清掉
       applyFloatVisibility();
     });
   }
 
   // -------------------------------------------------------------------------
-  // 魔杖菜单入口
+  // 魔杖菜单
   // -------------------------------------------------------------------------
 
   const WAND_ID = 'so-next-beat-wand-button';
@@ -991,7 +1163,11 @@
     item.className = 'list-group-item flex-container flexGap5 interactable';
     item.tabIndex = 0;
     item.innerHTML = '<i class="fa-solid fa-compass"></i><span>下一拍建议</span>';
-    item.addEventListener('click', () => togglePanel(true));
+    item.addEventListener('click', () => {
+      floatUserHidden = false;   // 用户从菜单主动打开 → 解除「本次隐藏」
+      applyFloatVisibility();
+      togglePanel(true);
+    });
     menu.appendChild(item);
     return true;
   }
@@ -1042,7 +1218,7 @@
       <h4>🧭 下一拍建议（配套故事神谕，独立扩展 v${VERSION}）</h4>
       <label class="checkbox_label">
         <input id="so_next_beat_enabled" type="checkbox">
-        正文生成后自动生成「下一拍」的玩家指令建议
+        每条新回复自动生成（默认关；手动点更省 API）
       </label>
       <label class="checkbox_label">
         <input id="so_next_beat_chip" type="checkbox">
@@ -1072,7 +1248,10 @@
         saveSettings();
         syncSettingsUI();
         if (key === 'showChip') refreshChips();
-        if (key === 'showFloat') applyFloatVisibility();
+        if (key === 'showFloat') {
+          if (this.checked) floatUserHidden = false;   // 用户主动打开 → 清掉「本次隐藏」
+          applyFloatVisibility();
+        }
       });
     };
     bindToggle('so_next_beat_enabled', 'enabled');
