@@ -1,6 +1,6 @@
 // ============================================================================
 // 故事神谕 · 下一拍建议（独立插件，不改 story-oracle 任何代码）
-// v2.0.0
+// v2.1.0
 //
 // 功能：
 //   主聊天每收到一条新的 AI 回复后，本插件自动：
@@ -10,52 +10,52 @@
 //        得到干净的正文；
 //     3) 调一次 story-oracle 已配置好的连接（api.run），让模型写出「一句最适合
 //        玩家现在发送、能自然把剧情推进到本拍目标」的指令；
-//     4) 把这句话贴在对应 AI 回复下方（chip）+ 面板里同步显示，点一下即填入
+//     4) 把这句话贴在对应 AI 回复下方（chip）+ 悬浮窗同步显示，点一下即填入
 //        输入框（不自动发送，可编辑）。
 //
-// 关键修复（v2.0.0 相对社区 v1.2.0）：
+// v2.1.0 新增：
+//   - 中心面板可拖动（按住标题栏拖）+ 位置记忆 + ⌖ 一键复位
+//   - 面板手机适配：宽度 min(340px, 100vw-16px)、高度 dvh、顶部不贴边
+//   - 悬浮窗（opt-in）：常驻一角，折叠成 🧭 圆标，收到新建议自己冒出来；
+//     可拖动、位置记忆、有未读建议时呼吸光
+//
+// 关键修复（相对社区版 v1.2.0）：
 //   - maxTokens 从 300 提到 4096 地板（300 会被 reasoning 模型的思考 token 吃光，
 //     输出被截在半句——社区版实测 bug）；
-//   - 用 unsafe.eval 复用 story-oracle 的剥离逻辑，不再自己手写正则（避免两套
-//     规则漂移，社区版 <json_patch> / <story_plan> 都漏了）；
+//   - 用 unsafe.eval 复用 story-oracle 的剥离逻辑，不再自己手写正则；
 //   - 读到 active 拍的 goal 并喂进 prompt，让建议能真正对上「下一拍」；
-//   - 加 AbortController + 240s 超时（社区版一旦发出就无法中断）；
-//   - 加「同一楼只处理一次」的持久去重（社区版刷新页面会全量重跑历史消息）；
-//   - 加「最新一条生效」的并发控制（社区版连掷 5 次会并发 5 个请求）；
-//   - 加全量重挂（MESSAGE_SWIPED / MESSAGE_EDITED / MESSAGE_DELETED / CHAT_CHANGED）
-//     ——楼层被别的扩展重画后 chip 会自己补回来；
-//   - lastSuggestion 按聊天隔离（社区版切聊天会串味）；
-//   - 魔杖菜单入口改用 MutationObserver 补挂（社区版 setInterval 每 3 秒轮询）。
+//   - 加 AbortController + 240s 超时；
+//   - 加「同一楼只处理一次」的持久去重（存 chat_metadata，刷新后仍认得）；
+//   - 加「最新一条生效」的并发控制；
+//   - 加全量重挂（MESSAGE_SWIPED / MESSAGE_EDITED / MESSAGE_DELETED / CHAT_CHANGED）；
+//   - lastSuggestion 按聊天隔离；
+//   - 魔杖菜单入口改用 MutationObserver 补挂。
 // ============================================================================
 
 (function () {
   'use strict';
 
   const MODULE_ID = 'story-oracle-next-beat';
-  const VERSION = '2.0.0';
+  const VERSION = '2.1.0';
 
   const DEFAULTS = {
     enabled: true,          // 每条新回复自动生成建议
     showChip: true,         // 在回复下方显示 chip
-    showToast: false,       // 右下角 toast（默认关，chip 已够）
+    showToast: false,       // 右下角 toast（默认关）
+    showFloat: false,       // 悬浮窗（默认关，opt-in）
   };
 
-  // 生成一句话不需要长输出；但 reasoning 模型会把思考算进 max_tokens，
-  // 300 会被思考吃光（社区版实测 bug）。4096 与 story-oracle 本体所有后台
-  // 调用的地板一致；max_tokens 是上限不是预扣，成本不变。
-  const MIN_OUTPUT_TOKENS = 4096;
-  const REQUEST_TIMEOUT_MS = 240000;   // 与 story-oracle 本体的 POST_REPLY_CALL_TIMEOUT_MS 一致
+  const MIN_OUTPUT_TOKENS = 4096;      // reasoning 模型思考也吃 max_tokens
+  const REQUEST_TIMEOUT_MS = 240000;   // 与 story-oracle 本体一致
   const MIN_NARRATIVE_LEN = 10;
 
-  // 持久去重键前缀（存 chat_metadata，页面刷新后仍有效）
   const DONE_META_KEY = MODULE_ID + '_done';
-  const DONE_KEEP_MAX = 400;           // 每个聊天最多记 400 条，超出丢最旧
+  const DONE_KEEP_MAX = 400;
 
-  // 面板 / chip 上的进度 / 建议按聊天隔离
   let lastByChat = {};                 // { [chatKey]: { suggestion, beatInfo, messageId, at } }
   let panelEl = null;
-  let currentAbort = null;             // 当前在途请求（新请求发起时 abort 上一个）
-  let lastRequestKey = null;           // 最新一次请求的身份（防竞态：只有最后发出的那个能落地）
+  let currentAbort = null;
+  let lastRequestKey = null;
 
   // -------------------------------------------------------------------------
   // 基础
@@ -92,10 +92,8 @@
   }
 
   // -------------------------------------------------------------------------
-  // 持久去重（替换社区版的内存 Set）
+  // 持久去重（存 chat_metadata，页面刷新后仍有效）
   // -------------------------------------------------------------------------
-  // key 形如 `${chatKey}:${messageId}:${swipeId}`；存 chat_metadata。
-  // 页面刷新后仍认得，避免把历史消息重跑一遍（社区版的最大行为 bug）。
 
   function readDoneSet() {
     const ctx = getCtx();
@@ -111,7 +109,6 @@
     if (!md) return;
     const arr = Array.isArray(md[DONE_META_KEY]) ? md[DONE_META_KEY].slice() : [];
     if (!arr.includes(key)) arr.push(key);
-    // 上限保护：只留最近 N 条
     while (arr.length > DONE_KEEP_MAX) arr.shift();
     md[DONE_META_KEY] = arr;
     try {
@@ -125,11 +122,8 @@
   }
 
   // -------------------------------------------------------------------------
-  // 复用 story-oracle 的剥离逻辑（unsafe.eval）
+  // unsafe.eval 封装
   // -------------------------------------------------------------------------
-  // 不再自己手写正则 —— 社区版漏了 <json_patch>、<story_plan> 等变体，
-  // 与 story-oracle 本体两套规则必然漂移。这里直接调它自己的两个函数，
-  // 剥出来的正文与它内部使用的完全一致。
 
   function apiSafeEval(expr, fallback) {
     const api = window.StoryOracleAPI;
@@ -142,6 +136,10 @@
       return fallback;
     }
   }
+
+  // -------------------------------------------------------------------------
+  // 复用 story-oracle 的剥离逻辑
+  // -------------------------------------------------------------------------
 
   function cleanNarrative(raw) {
     const text = String(raw == null ? '' : raw);
@@ -158,11 +156,8 @@
   }
 
   // -------------------------------------------------------------------------
-  // 读序列状态（unsafe.eval）
+  // 读序列状态
   // -------------------------------------------------------------------------
-  // 返回 null（没有序列）或：
-  //   { seqTitle, progress, beatTitle, goal, seed, why, cursor, total }
-  // goal 取【当前 active 拍】—— 玩家接下来要开启的那一拍。
 
   function getActiveBeatInfo() {
     const seq = apiSafeEval(
@@ -189,7 +184,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // Prompt 组装
+  // Prompt
   // -------------------------------------------------------------------------
 
   const SYSTEM_PROMPT =
@@ -247,7 +242,6 @@
       return null;
     }
 
-    // 并发控制：新请求发起时 abort 上一个在途请求
     if (currentAbort) {
       try { currentAbort.abort(); } catch (e) { /* ignore */ }
     }
@@ -255,7 +249,6 @@
     currentAbort = ctl;
     const timer = setTimeout(() => { try { ctl.abort(); } catch (e) { /* ignore */ } }, REQUEST_TIMEOUT_MS);
 
-    // maxTokens：地板 4096（reasoning 模型思考也吃 max_tokens）
     let userMax = 0;
     try {
       if (typeof api.getSettings === 'function') {
@@ -282,14 +275,10 @@
         text = result.text || result.content || result.reply || '';
       }
       text = String(text || '').trim();
-      // 模型偶尔会自己套引号；只剥成对的首尾引号，不误伤台词里的引号
       text = text.replace(/^["“'「『]+/, '').replace(/["”'」』]+$/, '').trim();
       return text || null;
     } catch (err) {
-      if (err && err.name === 'AbortError') {
-        // 主动中断或新请求顶替 —— 静默
-        return null;
-      }
+      if (err && err.name === 'AbortError') return null;
       console.error('[next-beat] 调用失败：', err);
       return null;
     } finally {
@@ -357,9 +346,6 @@
       }
     });
 
-    // 插到 .mes_text 之后（与 story-oracle 自己的 ✂️ 入口同一挂载哲学：
-    // 挂在 .mes 一层、不进 .mes_text 内部，被 AI 输出正则 / 酒馆助手重画
-    // .mes_text 时不会连带被清掉）
     const anchor = $mes.querySelector('.mes_text');
     if (anchor && anchor.parentNode) {
       anchor.parentNode.insertBefore(chip, anchor.nextSibling);
@@ -369,9 +355,8 @@
   }
 
   // -------------------------------------------------------------------------
-  // 全量重挂：楼层被别的扩展重画后，把已知 chip 补回来
+  // 全量重挂 chip
   // -------------------------------------------------------------------------
-  // 与 story-oracle 的 refreshFixChatEntry 同一策略 —— 每次相关事件都全量重挂。
 
   function rehangChips() {
     const key = chatKey();
@@ -387,7 +372,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // Toast（可选，默认关）
+  // Toast
   // -------------------------------------------------------------------------
 
   function ensureToastContainer() {
@@ -442,13 +427,12 @@
   }
 
   // -------------------------------------------------------------------------
-  // 按聊天隔离的 lastSuggestion
+  // lastSuggestion（按聊天隔离）
   // -------------------------------------------------------------------------
 
   function setLast(entry) {
     const key = chatKey();
     lastByChat[key] = Object.assign({ at: Date.now() }, entry || {});
-    // 上限保护：只留最近 30 个聊天
     const keys = Object.keys(lastByChat);
     if (keys.length > 30) {
       keys.sort((a, b) => (lastByChat[a].at || 0) - (lastByChat[b].at || 0));
@@ -462,8 +446,26 @@
   }
 
   // -------------------------------------------------------------------------
-  // 浮动面板
+  // 中心面板
   // -------------------------------------------------------------------------
+
+  const PANEL_POS_KEY = MODULE_ID + '_panel_pos';
+
+  function loadPanelPos() {
+    try {
+      const raw = localStorage.getItem(PANEL_POS_KEY);
+      if (!raw) return null;
+      const o = JSON.parse(raw);
+      if (Number.isFinite(o.left) && Number.isFinite(o.top)) return o;
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+  function savePanelPos(left, top) {
+    try { localStorage.setItem(PANEL_POS_KEY, JSON.stringify({ left, top })); } catch (e) { /* ignore */ }
+  }
+  function clearPanelPos() {
+    try { localStorage.removeItem(PANEL_POS_KEY); } catch (e) { /* ignore */ }
+  }
 
   function ensurePanel() {
     if (panelEl && panelEl.isConnected) return panelEl;
@@ -472,8 +474,9 @@
     panelEl = document.createElement('div');
     panelEl.id = 'so-next-beat-panel';
     panelEl.innerHTML = `
-      <div class="so-nb-panel-header">
+      <div class="so-nb-panel-header" id="so-nb-panel-drag-handle" title="按住可拖动此窗口">
         <span>🧭 下一拍建议</span>
+        <span class="so-nb-panel-reset" id="so-nb-panel-reset" title="重置到默认位置">⌖</span>
         <span class="so-nb-panel-close" title="关闭">×</span>
       </div>
       <div class="so-nb-panel-body">
@@ -489,6 +492,11 @@
           <input type="checkbox" id="so-nb-panel-toast" ${settings.showToast ? 'checked' : ''}>
           额外用右下角浮窗提示
         </label>
+        <label class="checkbox_label so-nb-toggle-row">
+          <input type="checkbox" id="so-nb-panel-float" ${settings.showFloat ? 'checked' : ''}>
+          悬浮窗常驻（折叠成 🧭 圆标，收到新建议自己冒出来）
+        </label>
+        <p class="so-nb-panel-label-hint">拖动圆标 / 标题栏可移动；位置会记住。</p>
         <div class="so-nb-panel-label">当前拍：</div>
         <div class="so-nb-panel-beat" id="so-nb-panel-beat">（未在引导序列中）</div>
         <div class="so-nb-panel-label">最近一次建议：</div>
@@ -501,6 +509,71 @@
     `;
     document.body.appendChild(panelEl);
 
+    // —— 位置记忆 ——
+    (function applyStoredPos() {
+      const p = loadPanelPos();
+      if (!p) return;
+      panelEl.style.left = p.left + 'px';
+      panelEl.style.top = p.top + 'px';
+      panelEl.style.transform = 'scale(0.96)';
+    })();
+
+    // —— 重置位置 ——
+    panelEl.querySelector('#so-nb-panel-reset').addEventListener('click', (e) => {
+      e.stopPropagation();
+      clearPanelPos();
+      panelEl.style.left = '';
+      panelEl.style.top = '';
+      panelEl.style.transform = '';
+    });
+
+    // —— 拖动 ——
+    (function wireDrag() {
+      const handle = panelEl.querySelector('#so-nb-panel-drag-handle');
+      let sx = 0, sy = 0, sl = 0, st = 0, pid = null, moved = false;
+      handle.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('.so-nb-panel-close') || e.target.closest('.so-nb-panel-reset')) return;
+        if (e.button != null && e.button > 0) return;
+        pid = e.pointerId;
+        moved = false;
+        const r = panelEl.getBoundingClientRect();
+        sx = e.clientX; sy = e.clientY; sl = r.left; st = r.top;
+        panelEl.style.left = sl + 'px';
+        panelEl.style.top = st + 'px';
+        panelEl.style.transform = '';
+        panelEl.classList.add('so-nb-dragging');
+        try { handle.setPointerCapture(pid); } catch (_) { /* ignore */ }
+      });
+      handle.addEventListener('pointermove', (e) => {
+        if (e.pointerId !== pid) return;
+        const dx = e.clientX - sx, dy = e.clientY - sy;
+        if (!moved && Math.hypot(dx, dy) < 4) return;
+        moved = true;
+        const w = panelEl.offsetWidth, h = panelEl.offsetHeight;
+        const vw = window.innerWidth, vh = window.innerHeight;
+        const nx = Math.max(80 - w, Math.min(vw - 80, sl + dx));
+        const ny = Math.max(0, Math.min(vh - 40, st + dy));
+        panelEl.style.left = nx + 'px';
+        panelEl.style.top = ny + 'px';
+      });
+      const end = (e) => {
+        if (pid == null || (e && e.pointerId !== pid)) return;
+        try { handle.releasePointerCapture(pid); } catch (_) { /* ignore */ }
+        pid = null;
+        panelEl.classList.remove('so-nb-dragging');
+        if (moved) {
+          const r = panelEl.getBoundingClientRect();
+          savePanelPos(Math.round(r.left), Math.round(r.top));
+          const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+          panelEl.addEventListener('click', swallow, { capture: true, once: true });
+          setTimeout(() => panelEl.removeEventListener('click', swallow, { capture: true }), 300);
+        }
+      };
+      handle.addEventListener('pointerup', end);
+      handle.addEventListener('pointercancel', end);
+    })();
+
+    // —— 关闭 / 开关 ——
     panelEl.querySelector('.so-nb-panel-close').addEventListener('click', () => togglePanel(false));
 
     const bindToggle = (id, key) => {
@@ -511,11 +584,13 @@
         saveSettings();
         syncSettingsUI();
         if (key === 'showChip') refreshChips();
+        if (key === 'showFloat') applyFloatVisibility();
       });
     };
     bindToggle('#so-nb-panel-enabled', 'enabled');
     bindToggle('#so-nb-panel-chip', 'showChip');
     bindToggle('#so-nb-panel-toast', 'showToast');
+    bindToggle('#so-nb-panel-float', 'showFloat');
 
     panelEl.querySelector('#so-nb-panel-use').addEventListener('click', () => {
       const entry = getLast();
@@ -523,7 +598,6 @@
         fillInput(entry.suggestion);
         togglePanel(false);
       } else {
-        // N3：空建议时点「使用这句」有反馈，不是静默无反应
         setPanelSuggestion('（还没有建议——等一条新的正文回复，或点右边「针对最新回复生成」）');
       }
     });
@@ -557,6 +631,7 @@
           setLast({ suggestion, beatInfo, messageId: idx });
           renderChip(idx, suggestion, beatInfo);
           showSuggestionToast(suggestion);
+          notifyFloatNewSuggestion(suggestion);
         } else {
           setPanelSuggestion('（这次没能生成，看看浏览器控制台）');
         }
@@ -611,223 +686,127 @@
   }
 
   // -------------------------------------------------------------------------
-  // 触发：每条新的 AI 回复
+  // 悬浮窗（v2.1.0）
   // -------------------------------------------------------------------------
 
-  function isAiMessage(ctx, messageId) {
-    const m = ctx && ctx.chat && ctx.chat[messageId];
-    if (!m || m.is_user || m.is_system) return false;
-    return typeof m.mes === 'string' && m.mes.trim().length > 0;
+  const FLOAT_ID = 'so-nb-float';
+  const FLOAT_POS_KEY = MODULE_ID + '_float_pos';
+  let floatEl = null;
+  let floatCollapsed = true;
+  let floatFresh = false;
+
+  function loadFloatPos() {
+    try {
+      const raw = localStorage.getItem(FLOAT_POS_KEY);
+      if (!raw) return null;
+      const o = JSON.parse(raw);
+      if (Number.isFinite(o.left) && Number.isFinite(o.top)) return o;
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+  function saveFloatPos(left, top) {
+    try { localStorage.setItem(FLOAT_POS_KEY, JSON.stringify({ left, top })); } catch (e) { /* ignore */ }
   }
 
-  async function onMessageRendered(messageId) {
-    const settings = loadSettings();
-    if (!settings.enabled) return;
+  function ensureFloat() {
+    if (floatEl && floatEl.isConnected) return floatEl;
 
-    const ctx = getCtx();
-    if (!ctx || !isAiMessage(ctx, messageId)) return;
-
-    const m = ctx.chat[messageId];
-    const swipeId = m.swipe_id || 0;
-    const key = `${chatKey()}:${messageId}:${swipeId}`;
-
-    // 持久去重：页面刷新后不再重跑历史消息
-    if (isDone(key)) return;
-
-    const narrative = cleanNarrative(m.mes);
-    if (!narrative || narrative.length < MIN_NARRATIVE_LEN) return;
-
-    // 在发起请求前就标记 done —— 即使请求失败也不重跑（用户可点面板「针对最新回复生成」重试）
-    markDone(key);
-
-    const beatInfo = getActiveBeatInfo();
-    const myKey = key;   // 闭包捕获
-    lastRequestKey = myKey;
-
-    const suggestion = await requestNextBeatOption(narrative, beatInfo);
-
-    // 竞态守卫：只有最新一次请求的结果能落地（连掷多条时旧的静默丢弃）
-    if (lastRequestKey !== myKey) return;
-    if (!suggestion) return;
-    // 二次核对：这条消息还在、还是同一条 swipe
-    const cur = ctx.chat[messageId];
-    if (!cur || ((cur.swipe_id || 0) !== swipeId)) return;
-
-    setLast({ suggestion, beatInfo, messageId });
-    renderChip(messageId, suggestion, beatInfo);
-    showSuggestionToast(suggestion);
-  }
-
-  // -------------------------------------------------------------------------
-  // 事件绑定
-  // -------------------------------------------------------------------------
-
-  function bindEvents() {
-    const ctx = getCtx();
-    if (!ctx || !ctx.eventSource || !ctx.event_types) {
-      setTimeout(bindEvents, 500);
-      return;
-    }
-    const et = ctx.event_types;
-    const on = (ev, fn) => { try { ctx.eventSource.on(ev, fn); } catch (e) { /* ignore */ } };
-
-    on(et.CHARACTER_MESSAGE_RENDERED, (id) => {
-      Promise.resolve(onMessageRendered(id)).catch((e) => console.warn('[next-beat] 处理失败：', e));
-      // 别的扩展可能重画了楼层 —— chip 全量重挂
-      setTimeout(refreshChips, 50);
-    });
-    // 楼层重画 / 换 swipe / 编辑 / 删除 / 切聊天 —— 全量重挂 chip（复用 story-oracle 自身的策略）
-    ['MESSAGE_SWIPED', 'MESSAGE_EDITED', 'MESSAGE_DELETED'].forEach((name) => {
-      if (et[name]) on(et[name], () => setTimeout(refreshChips, 30));
-    });
-    if (et.CHAT_CHANGED) on(et.CHAT_CHANGED, () => {
-      // 切聊天：清掉当前挂的 chip（chips 是按当前聊天的 messageId 定位的，换了聊天就没有意义）
-      removeAllChips();
-      // 把新聊天里已存在的那一条 chip 挂回来（如果有）
-      setTimeout(rehangChips, 100);
-      updatePanel();
-    });
-  }
-
-  // -------------------------------------------------------------------------
-  // 魔杖菜单入口（MutationObserver 补挂，不用轮询）
-  // -------------------------------------------------------------------------
-
-  const WAND_ID = 'so-next-beat-wand-button';
-
-  function injectWandButton() {
-    const menu = document.getElementById('extensionsMenu');
-    if (!menu) return false;
-    if (document.getElementById(WAND_ID) && menu.contains(document.getElementById(WAND_ID))) return true;
-
-    // 已经存在于别处（被搬动过）→ 清掉重建
-    const old = document.getElementById(WAND_ID);
-    if (old) old.remove();
-
-    const item = document.createElement('div');
-    item.id = WAND_ID;
-    item.className = 'list-group-item flex-container flexGap5 interactable';
-    item.tabIndex = 0;
-    item.innerHTML = '<i class="fa-solid fa-compass"></i><span>下一拍建议</span>';
-    item.addEventListener('click', () => togglePanel(true));
-    menu.appendChild(item);
-    return true;
-  }
-
-  function watchWandMenu() {
-    if (!injectWandButton()) {
-      // 菜单还没建 —— 用 MutationObserver 盯着 body，出现就挂
-      const mo = new MutationObserver(() => {
-        if (injectWandButton()) mo.disconnect();
-      });
-      mo.observe(document.body, { childList: true, subtree: true });
-      return;
-    }
-    // 菜单在了 —— 盯住它，被别的扩展重画时补挂
-    const menu = document.getElementById('extensionsMenu');
-    if (menu) {
-      const mo = new MutationObserver(() => { injectWandButton(); });
-      mo.observe(menu, { childList: true, subtree: true });
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // 设置面板（ST 扩展设置区）
-  // -------------------------------------------------------------------------
-
-  function syncSettingsUI() {
-    const s = loadSettings();
-    const set = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
-    set('so_next_beat_enabled', s.enabled);
-    set('so_next_beat_chip', s.showChip);
-    set('so_next_beat_toast', s.showToast);
-    if (panelEl && panelEl.isConnected) {
-      set('so-nb-panel-enabled', s.enabled);
-      set('so-nb-panel-chip', s.showChip);
-      set('so-nb-panel-toast', s.showToast);
-    }
-  }
-
-  function addSettingsUI() {
-    if (document.getElementById('so-next-beat-settings')) return;
-    const container = document.querySelector('#extensions_settings2, #extensions_settings');
-    if (!container) return;
-
-    const div = document.createElement('div');
-    div.id = 'so-next-beat-settings';
-    div.className = 'so-next-beat-settings';
-    div.innerHTML = `
-      <h4>🧭 下一拍建议（配套故事神谕，独立扩展 v${VERSION}）</h4>
-      <label class="checkbox_label">
-        <input id="so_next_beat_enabled" type="checkbox">
-        正文生成后自动生成「下一拍」的玩家指令建议
-      </label>
-      <label class="checkbox_label">
-        <input id="so_next_beat_chip" type="checkbox">
-        在对应回复下方显示建议
-      </label>
-      <label class="checkbox_label">
-        <input id="so_next_beat_toast" type="checkbox">
-        额外用右下角浮窗提示
-      </label>
-      <p style="opacity:0.7; font-size:0.85em;">
-        也可以点输入框旁 🪄 菜单里的「下一拍建议」打开小窗口。
-      </p>
+    floatEl = document.createElement('div');
+    floatEl.id = FLOAT_ID;
+    floatEl.className = 'so-nb-float-hidden so-nb-float-collapsed';
+    floatEl.innerHTML = `
+      <div class="so-nb-float-badge" title="🧭 下一拍建议（点开）">🧭</div>
+      <div class="so-nb-float-body">
+        <div class="so-nb-float-head" id="so-nb-float-drag-handle">
+          <span class="so-nb-float-title">🧭 下一拍建议</span>
+          <span class="so-nb-float-icon-btn" id="so-nb-float-collapse" title="折叠">—</span>
+          <span class="so-nb-float-icon-btn" id="so-nb-float-close" title="关闭悬浮窗">×</span>
+        </div>
+        <div class="so-nb-float-content" id="so-nb-float-content">（暂无建议）</div>
+        <div class="so-nb-float-actions">
+          <button type="button" class="so-next-beat-btn so-next-beat-use" id="so-nb-float-use">使用这句</button>
+          <button type="button" class="so-next-beat-btn" id="so-nb-float-regen">重生成</button>
+        </div>
+      </div>
     `;
-    container.appendChild(div);
-    syncSettingsUI();
+    document.body.appendChild(floatEl);
 
-    const bindToggle = (id, key) => {
-      const el = document.getElementById(id);
-      if (!el) return;
-      el.addEventListener('change', function () {
-        const s = loadSettings();
-        s[key] = this.checked;
-        saveSettings();
-        syncSettingsUI();
-        if (key === 'showChip') refreshChips();
-      });
-    };
-    bindToggle('so_next_beat_enabled', 'enabled');
-    bindToggle('so_next_beat_chip', 'showChip');
-    bindToggle('so_next_beat_toast', 'showToast');
-  }
+    const p = loadFloatPos();
+    if (p) {
+      floatEl.style.left = p.left + 'px';
+      floatEl.style.top = p.top + 'px';
+      floatEl.style.right = 'auto';
+    }
 
-  // -------------------------------------------------------------------------
-  // 等 story-oracle 就绪
-  // -------------------------------------------------------------------------
-
-  function waitForStoryOracle(callback) {
-    if (window.StoryOracleAPI) { callback(); return; }
-    document.addEventListener('story-oracle-ready', callback, { once: true });
-    let tries = 0;
-    const timer = setInterval(() => {
-      tries += 1;
-      if (window.StoryOracleAPI) { clearInterval(timer); callback(); }
-      else if (tries > 30) { clearInterval(timer); console.warn('[next-beat] 等待故事神谕超时'); }
-    }, 500);
-  }
-
-  // -------------------------------------------------------------------------
-  // 启动
-  // -------------------------------------------------------------------------
-
-  jQuery(async () => {
-    waitForStoryOracle(() => {
-      const api = window.StoryOracleAPI;
-      if (!api) {
-        console.warn('[next-beat] 没有检测到故事神谕（StoryOracleAPI），本扩展不生效');
-        return;
+    floatEl.querySelector('.so-nb-float-badge').addEventListener('click', () => {
+      if (floatCollapsed) {
+        setFloatCollapsed(false);
+        floatFresh = false;
+        floatEl.classList.remove('so-nb-float-fresh');
       }
-      if (typeof api.isCompatible === 'function' && !api.isCompatible(1)) {
-        console.warn('[next-beat] 故事神谕接口版本不兼容，本扩展跳过');
-        return;
-      }
-      addSettingsUI();
-      bindEvents();
-      watchWandMenu();
-      refreshChips();
-      console.log('[next-beat] 已加载（v' + VERSION + '）');
     });
-  });
-})();
+
+    floatEl.querySelector('#so-nb-float-collapse').addEventListener('click', () => setFloatCollapsed(true));
+    floatEl.querySelector('#so-nb-float-close').addEventListener('click', () => setFloatVisible(false));
+
+    floatEl.querySelector('#so-nb-float-use').addEventListener('click', () => {
+      const entry = getLast();
+      if (entry && entry.suggestion) {
+        fillInput(entry.suggestion);
+      } else {
+        setFloatContent('（还没有建议——等一条新的正文回复，或点「重生成」）');
+      }
+    });
+
+    floatEl.querySelector('#so-nb-float-regen').addEventListener('click', async () => {
+      const btn = floatEl.querySelector('#so-nb-float-regen');
+      const old = btn.textContent;
+      btn.textContent = '生成中…';
+      btn.disabled = true;
+      try {
+        const ctx = getCtx();
+        if (!ctx || !ctx.chat || !ctx.chat.length) { setFloatContent('（找不到聊天）'); return; }
+        let idx = -1;
+        for (let i = ctx.chat.length - 1; i >= 0; i--) {
+          const m = ctx.chat[i];
+          if (m && !m.is_user && !m.is_system && typeof m.mes === 'string' && m.mes.trim()) { idx = i; break; }
+        }
+        if (idx === -1) { setFloatContent('（找不到可用的 AI 回复）'); return; }
+        const narrative = cleanNarrative(ctx.chat[idx].mes);
+        if (!narrative || narrative.length < MIN_NARRATIVE_LEN) { setFloatContent('（这条回复没有可用的正文）'); return; }
+        const beatInfo = getActiveBeatInfo();
+        const suggestion = await requestNextBeatOption(narrative, beatInfo);
+        if (suggestion) {
+          setLast({ suggestion, beatInfo, messageId: idx });
+          renderChip(idx, suggestion, beatInfo);
+          showSuggestionToast(suggestion);
+          setFloatContent(suggestion);
+        } else {
+          setFloatContent('（这次没能生成，看看浏览器控制台）');
+        }
+      } finally {
+        btn.textContent = old;
+        btn.disabled = false;
+      }
+    });
+
+    wireFloatDrag();
+    return floatEl;
+  }
+
+  function wireFloatDrag() {
+    const badge = floatEl.querySelector('.so-nb-float-badge');
+    const handle = floatEl.querySelector('#so-nb-float-drag-handle');
+    const makeDrag = (el) => {
+      let sx = 0, sy = 0, sl = 0, st = 0, pid = null, moved = false;
+      el.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('.so-nb-float-icon-btn')) return;
+        if (e.button != null && e.button > 0) return;
+        pid = e.pointerId;
+        moved = false;
+        const r = floatEl.getBoundingClientRect();
+        sx = e.clientX; sy = e.clientY; sl = r.left; st = r.top;
+        floatEl.style.left = sl + 'px';
+        floatEl.style.top = st + 'px';
+        floatEl.style.right = 'auto';
+        try { el.setPointerCapture(pid); } catch (_
