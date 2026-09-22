@@ -1,0 +1,12 @@
+{
+  "display_name": "故事神谕 · 下一拍建议",
+  "loading_order": 100,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "community add-on",
+  "version": "1.0.0",
+  "homePage": "https://github.com/yacovonebeswick-art/story-oracle",
+  "auto_update": false
+}

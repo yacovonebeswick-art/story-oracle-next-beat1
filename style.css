@@ -1,0 +1,26 @@
+.so-next-beat-chip {
+  margin: 6px 0 2px 0;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px dashed rgba(128, 128, 128, 0.5);
+  font-size: 0.85em;
+  opacity: 0.85;
+  cursor: pointer;
+  user-select: none;
+  transition: opacity 0.15s ease, background-color 0.15s ease;
+  display: inline-block;
+  max-width: 100%;
+}
+
+.so-next-beat-chip:hover {
+  opacity: 1;
+  background-color: rgba(128, 128, 128, 0.12);
+}
+
+.so-next-beat-chip .so-next-beat-text {
+  font-style: italic;
+}
+
+.so-next-beat-settings h4 {
+  margin-bottom: 4px;
+}
