@@ -1,17 +1,14 @@
 // ============================================================================
 // 故事神谕 · 下一拍建议（独立插件，不改 story-oracle 任何代码）
-// v3.5.0
+// v3.6.0
 //
-// v3.5.0 新增：连接设置
-//   · 默认【继承故事神谕的连接设置】，只覆盖「模型名」（可以填一个便宜/快速的
-//     模型，专门给建议用，不占神谕的 pro 模型）。
-//   · 也可以取消勾选「继承」，改成【独立连接】：自己填 端点/密钥/连接模式/
-//     配置文件/后端转发/地址原样 等全套。
-//   · 走神谕内部传输层（unsafe.eval 拿 callDirect/callProfile/streamDirect），
-//     复用它的 URL 规范化、后端转发、附加参数、错误展开；
-//     拿不到内部函数时安全降级到「用神谕的 api.run」（= 现状）。
+// 连接设置：
+//   · 二选一：○ 使用故事神谕的连接（默认）   ○ 使用我自己的连接
+//   · 用我自己的：填端点 / key → 点「拉取模型列表」→ 从下拉挑模型
+//   · 模型名只能从下拉选（不手写）；没选 = 报错提示
+//   · 支持「经后端转发（避免 CORS）」和「地址原样使用」
 //
-// 其它设计（沿用 v3.4.0）：
+// 其它：
 //   · 楼层 chip = 候选结果的唯一展示位。
 //   · 中心面板 / 悬浮球卡片只用来"触发生成"；点完自动收起；不重复显示候选。
 //   · 悬浮球（🧭 圆标）常驻；生成完圆标呼吸提示。
@@ -24,25 +21,22 @@
   'use strict';
 
   const MODULE_ID = 'story-oracle-next-beat';
-  const VERSION = '3.5.0';
-  const CFG_VERSION = 7;
+  const VERSION = '3.6.0';
+  const CFG_VERSION = 8;
 
   const DEFAULTS = {
     enabled: false,
     showChip: true,
     showToast: false,
     showFloat: false,
-    // 连接设置
-    connInherit: true,        // 默认继承神谕的连接
-    connModelOverride: '',    // 继承模式下：覆盖的模型名（空 = 用神谕的模型）
-    // 独立连接（connInherit = false 时生效）
-    connMode: 'direct',       // 'direct' | 'profile'
+    // 连接
+    useOwnConnection: false,   // false = 用神谕的连接；true = 用下面的独立连接
     connEndpoint: '',
     connApiKey: '',
-    connModel: '',
-    connProfileId: '',
+    connModel: '',             // 从下拉选出来的
     connDirectViaBackend: false,
     connDirectRawUrl: false,
+    connModelList: [],         // 上次拉取到的模型列表（缓存，重开面板仍在下拉）
   };
 
   const MIN_OUTPUT_TOKENS = 4096;
@@ -286,10 +280,9 @@
   }
 
   // -------------------------------------------------------------------------
-  // 请求发送：三路分发
-  //   ① 继承 + 未覆盖模型 → api.run（现状：完全用神谕的模型与连接）
-  //   ② 继承 + 覆盖模型   → 借用神谕内部传输层，只覆盖 model
-  //   ③ 不继承（独立）   → 自己直连 / 走 profile
+  // 请求发送：两路
+  //   ① 用神谕的连接 → api.run
+  //   ② 用我自己的连接 → 直连（或经后端转发）
   // -------------------------------------------------------------------------
 
   async function requestNextBeatOptions(narrativeText, beatInfo) {
@@ -301,7 +294,6 @@
 
     const s = loadSettings();
 
-    // 并发控制
     if (currentAbort) {
       try { currentAbort.abort(); } catch (e) { /* ignore */ }
     }
@@ -309,7 +301,6 @@
     currentAbort = ctl;
     const timer = setTimeout(() => { try { ctl.abort(); } catch (e) { /* ignore */ } }, REQUEST_TIMEOUT_MS);
 
-    // 输出预算
     let userMax = 0;
     try {
       if (typeof api.getSettings === 'function') {
@@ -326,32 +317,23 @@
 
     try {
       let text = '';
-
-      if (s.connInherit) {
-        const override = String(s.connModelOverride || '').trim();
-        if (!override) {
-          // ① 完全跟随神谕
-          if (typeof api.run !== 'function') {
-            console.warn('[next-beat] api.run 不可用，跳过');
-            return null;
-          }
-          const result = await api.run(messages, { stream: false, maxTokens, signal: ctl.signal });
-          text = pickText(result);
-        } else {
-          // ② 继承连接，只覆盖 model
-          text = await sendWithModelOverride(api, messages, maxTokens, override, ctl.signal);
+      if (!s.useOwnConnection) {
+        // ① 用神谕的连接
+        if (typeof api.run !== 'function') {
+          throw new Error('StoryOracleAPI.run 不可用');
         }
+        const result = await api.run(messages, { stream: false, maxTokens, signal: ctl.signal });
+        text = pickText(result);
       } else {
-        // ③ 完全独立连接
-        text = await sendWithOwnConnection(api, messages, maxTokens, s, ctl.signal);
+        // ② 用我自己的连接
+        text = await sendWithOwnConnection(messages, maxTokens, s, ctl.signal);
       }
-
       text = String(text || '').trim();
       return parseOptions(text);
     } catch (err) {
       if (err && err.name === 'AbortError') return null;
       console.error('[next-beat] 调用失败：', err);
-      return null;
+      throw err;   // 让上层能显示具体错误
     } finally {
       clearTimeout(timer);
       if (currentAbort === ctl) currentAbort = null;
@@ -366,92 +348,34 @@
     return '';
   }
 
-  // 路径 ② —— 借用神谕内部传输层，覆盖模型名
-  async function sendWithModelOverride(api, messages, maxTokens, modelOverride, signal) {
-    // 先试着拿神谕内部的传输函数
-    const callDirect = apiSafeEval('(typeof callDirect === "function" ? callDirect : null)', null);
-    const callProfile = apiSafeEval('(typeof callProfile === "function" ? callProfile : null)', null);
-    const resolveEndpointUrl = apiSafeEval('(typeof resolveEndpointUrl === "function" ? resolveEndpointUrl : null)', null);
-    const getSettings = apiSafeEval('(typeof getSettings === "function" ? getSettings : null)', null);
+  // 独立连接发送
+  async function sendWithOwnConnection(messages, maxTokens, s, signal) {
+    if (!s.connEndpoint) throw new Error('请先填写端点 URL');
+    if (!s.connModel) throw new Error('请先「拉取模型列表」并从下拉选择模型');
 
-    const os = (typeof getSettings === 'function') ? getSettings() : null;
-    if (!os) {
-      // 拿不到神谕设置（极旧版本），退回 api.run
-      console.warn('[next-beat] 拿不到神谕设置，退回 api.run（用神谕模型）');
-      const result = await api.run(messages, { stream: false, maxTokens, signal });
-      return pickText(result);
+    const url = normalizeUrl(s.connEndpoint, s.connDirectRawUrl);
+    const body = { model: s.connModel, messages, max_tokens: maxTokens };
+    const headers = { 'Content-Type': 'application/json' };
+    if (s.connApiKey) headers['Authorization'] = 'Bearer ' + s.connApiKey;
+
+    if (s.connDirectViaBackend) {
+      return await sendViaSTBackend(url, headers, body, signal);
     }
-
-    const stream = false;   // 建议生成很短，不需要流式
-
-    if (os.mode === 'direct' && typeof callDirect === 'function' && typeof resolveEndpointUrl === 'function') {
-      const url = resolveEndpointUrl(os);
-      const body = { model: modelOverride, messages, max_tokens: maxTokens };
-      if (os.sendTemperature) body.temperature = os.temperature;
-      return await callDirect(url, os.apiKey, body, signal);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ ...body, stream: false }),
+      signal,
+    });
+    if (!res.ok) {
+      const t = await res.text().catch(() => '');
+      throw new Error(`HTTP ${res.status} ${res.statusText} ${t.slice(0, 300)}`);
     }
-
-    if (os.mode === 'profile' && typeof callProfile === 'function') {
-      // profile 模式的模型来自 profile 本身，无法覆盖 —— 用神谕自己的 profile 走一次，
-      // model override 只能通过 overridePayload 透传（ST 后端不读 model，但无害）。
-      const override = os.sendTemperature ? { temperature: os.temperature } : {};
-      return await callProfile(os.profileId, messages, maxTokens, override, signal);
-    }
-
-    // 兜底：走 api.run（用神谕模型）
-    console.warn('[next-beat] 无法覆盖模型（模式不支持），退回 api.run');
-    const result = await api.run(messages, { stream: false, maxTokens, signal });
-    return pickText(result);
+    const data = await res.json();
+    return data?.choices?.[0]?.message?.content ?? '';
   }
 
-  // 路径 ③ —— 完全独立连接
-  async function sendWithOwnConnection(api, messages, maxTokens, s, signal) {
-    if (s.connMode === 'direct') {
-      if (!s.connEndpoint || !s.connModel) {
-        throw new Error('独立连接未配置：请到设置里填端点 URL 与模型');
-      }
-      const url = normalizeUrl(s.connEndpoint, s.connDirectRawUrl);
-      const body = { model: s.connModel, messages, max_tokens: maxTokens };
-      const headers = { 'Content-Type': 'application/json' };
-      if (s.connApiKey) headers['Authorization'] = 'Bearer ' + s.connApiKey;
-
-      if (s.connDirectViaBackend) {
-        return await sendViaSTBackend(url, headers, body, signal);
-      }
-      const res = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ ...body, stream: false }),
-        signal,
-      });
-      if (!res.ok) {
-        const t = await res.text().catch(() => '');
-        throw new Error(`HTTP ${res.status} ${res.statusText} ${t.slice(0, 300)}`);
-      }
-      const data = await res.json();
-      return data?.choices?.[0]?.message?.content ?? '';
-    }
-
-    // profile 模式
-    if (!s.connProfileId) {
-      throw new Error('独立连接未配置：请到设置里选一个连接配置文件');
-    }
-    const ctx = getCtx();
-    if (!ctx || !ctx.ConnectionManagerRequestService || typeof ctx.ConnectionManagerRequestService.sendRequest !== 'function') {
-      throw new Error('此 ST 版本缺少 ConnectionManagerRequestService');
-    }
-    const override = {};
-    const result = await ctx.ConnectionManagerRequestService.sendRequest(
-      s.connProfileId,
-      messages,
-      maxTokens,
-      { stream: false, extractData: true, signal },
-      override,
-    );
-    return result?.content ?? '';
-  }
-
-  // 独立连接的「经酒馆后端转发」（直连 CORS 问题时用）
+  // 经 ST 后端转发
   async function sendViaSTBackend(url, headers, body, signal) {
     const ctx = getCtx();
     if (!ctx || !ctx.ChatCompletionService || typeof ctx.ChatCompletionService.processRequest !== 'function') {
@@ -471,7 +395,7 @@
     return result?.content ?? '';
   }
 
-  // URL 规范化（与神谕同款逻辑）
+  // URL 规范化（与神谕同款）
   function normalizeUrl(u, raw) {
     u = String(u || '').trim().replace(/\/+$/, '');
     if (!u) return u;
@@ -479,6 +403,42 @@
     if (/\/v\d+$/.test(u)) return u + '/chat/completions';
     if (raw) return u + '/chat/completions';
     return u + '/v1/chat/completions';
+  }
+
+  // models URL（与神谕同款）
+  function modelsUrl(u, raw) {
+    u = String(u || '').trim().replace(/\/+$/, '');
+    if (!u) return u;
+    if (/\/chat\/completions$/.test(u)) return u.replace(/\/chat\/completions$/, '/models');
+    if (/\/models$/.test(u)) return u;
+    if (/\/v\d+$/.test(u)) return u + '/models';
+    if (raw) return u + '/models';
+    return u + '/v1/models';
+  }
+
+  // 拉取模型列表
+  async function fetchModelList() {
+    const s = loadSettings();
+    if (!s.connEndpoint) throw new Error('请先填写端点 URL');
+    const url = modelsUrl(s.connEndpoint, s.connDirectRawUrl);
+    const headers = {};
+    if (s.connApiKey) headers['Authorization'] = 'Bearer ' + s.connApiKey;
+
+    const signal = (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(20000) : undefined;
+    const res = await fetch(url, { method: 'GET', headers, signal });
+    if (!res.ok) {
+      const t = await res.text().catch(() => '');
+      throw new Error(`HTTP ${res.status} ${res.statusText} ${t.slice(0, 200)}`);
+    }
+    const data = await res.json();
+    const list = Array.isArray(data?.data) ? data.data
+      : Array.isArray(data) ? data
+      : Array.isArray(data?.models) ? data.models
+      : [];
+    const ids = [...new Set(
+      list.map((m) => (typeof m === 'string' ? m : (m?.id || m?.name))).filter(Boolean)
+    )].sort((a, b) => a.localeCompare(b));
+    return ids;
   }
 
   // -------------------------------------------------------------------------
@@ -495,7 +455,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // 候选列表渲染（只用于楼层 chip 和 toast）
+  // 候选列表渲染
   // -------------------------------------------------------------------------
 
   function labelClass(label) {
@@ -535,7 +495,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // Chip（楼层下方 —— 候选结果的唯一展示位）
+  // Chip
   // -------------------------------------------------------------------------
 
   function chipIdFor(messageId) { return 'so-next-beat-chip-' + messageId; }
@@ -711,7 +671,7 @@
   function getLast() { return lastByChat[chatKey()] || null; }
 
   // -------------------------------------------------------------------------
-  // 触发（手动）
+  // 触发
   // -------------------------------------------------------------------------
 
   async function generateOptionsForMessage(messageId) {
@@ -800,15 +760,12 @@
   async function onMessageRendered(messageId) {
     const s = loadSettings();
     if (!s.enabled) return;
-
     const ctx = getCtx();
     if (!ctx || !isAiMessage(ctx, messageId)) return;
-
     const m = ctx.chat[messageId];
     const swipeId = m.swipe_id || 0;
     const key = `${chatKey()}:${messageId}:${swipeId}`;
     if (isDone(key)) return;
-
     await triggerGenerateForMessage(messageId);
   }
 
@@ -832,6 +789,37 @@
   }
   function clearPanelPos() {
     try { localStorage.removeItem(PANEL_POS_KEY); } catch (e) { /* ignore */ }
+  }
+
+  function renderModelSelect() {
+    if (!panelEl || !panelEl.isConnected) return;
+    const sel = panelEl.querySelector('#so-nb-conn-model-select');
+    if (!sel) return;
+    const s = loadSettings();
+    const list = Array.isArray(s.connModelList) ? s.connModelList : [];
+    sel.innerHTML = '';
+    if (!list.length) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '（请先点「拉取模型列表」）';
+      sel.appendChild(opt);
+      sel.value = '';
+      sel.disabled = true;
+      return;
+    }
+    const ph = document.createElement('option');
+    ph.value = '';
+    ph.textContent = '（选择模型）';
+    sel.appendChild(ph);
+    for (const id of list) {
+      const opt = document.createElement('option');
+      opt.value = id;
+      opt.textContent = id;
+      sel.appendChild(opt);
+    }
+    sel.disabled = false;
+    if (s.connModel && list.includes(s.connModel)) sel.value = s.connModel;
+    else sel.value = '';
   }
 
   function ensurePanel() {
@@ -865,58 +853,43 @@
         </label>
         <p class="so-nb-panel-label-hint">本面板 / 悬浮球只用来"触发生成"；结果固定显示在对应楼层的下方。圆标只有取消「常驻」才会消失。</p>
 
-        <details class="so-nb-conn" id="so-nb-conn-details">
+        <details class="so-nb-conn" id="so-nb-conn-details" open>
           <summary>连接设置（建议专用）</summary>
           <div class="so-nb-conn-body">
             <label class="checkbox_label so-nb-toggle-row">
-              <input type="checkbox" id="so-nb-conn-inherit" ${s.connInherit ? 'checked' : ''}>
-              继承故事神谕的连接设置（只覆盖下面的"模型名"）
+              <input type="radio" name="so-nb-conn-mode" id="so-nb-conn-use-sy" ${!s.useOwnConnection ? 'checked' : ''}>
+              使用故事神谕的连接（默认）
             </label>
-            <label class="so-nb-panel-label-hint" style="margin-left:22px; display:block;">
-              建议用的模型和主神谕模型不同（比如主用 pro，建议用轻量快速模型）时，勾选此项、在下框填模型名即可。留空 = 完全跟随神谕。
-            </label>
-            <label class="so-nb-field">
-              <span>模型名（继承模式下生效；可留空）</span>
-              <input type="text" id="so-nb-conn-model-override" value="${escapeAttr(s.connModelOverride)}" placeholder="例如 gpt-4o-mini / gemini-flash / deepseek-chat">
+            <label class="checkbox_label so-nb-toggle-row">
+              <input type="radio" name="so-nb-conn-mode" id="so-nb-conn-use-own" ${s.useOwnConnection ? 'checked' : ''}>
+              使用我自己的连接
             </label>
 
-            <div id="so-nb-conn-own">
-              <p class="so-nb-panel-label-hint">取消勾选「继承」后，以下独立连接设置生效：</p>
+            <div id="so-nb-conn-own" style="display:none;">
               <label class="so-nb-field">
-                <span>连接模式</span>
-                <select id="so-nb-conn-mode">
-                  <option value="direct" ${s.connMode === 'direct' ? 'selected' : ''}>直连（自定义 URL）</option>
-                  <option value="profile" ${s.connMode === 'profile' ? 'selected' : ''}>连接配置文件</option>
-                </select>
+                <span>端点 URL</span>
+                <input type="text" id="so-nb-conn-endpoint" value="${escapeAttr(s.connEndpoint)}" placeholder="https://your-proxy.com/v1">
               </label>
-              <div id="so-nb-conn-direct">
-                <label class="so-nb-field">
-                  <span>端点 URL</span>
-                  <input type="text" id="so-nb-conn-endpoint" value="${escapeAttr(s.connEndpoint)}" placeholder="https://your-proxy.com/v1">
-                </label>
-                <label class="so-nb-field">
-                  <span>API 密钥</span>
-                  <input type="password" id="so-nb-conn-apikey" value="${escapeAttr(s.connApiKey)}" placeholder="sk-...">
-                </label>
-                <label class="so-nb-field">
-                  <span>模型</span>
-                  <input type="text" id="so-nb-conn-model" value="${escapeAttr(s.connModel)}" placeholder="gpt-4o-mini">
-                </label>
-                <label class="checkbox_label so-nb-toggle-row">
-                  <input type="checkbox" id="so-nb-conn-backend" ${s.connDirectViaBackend ? 'checked' : ''}>
-                  经酒馆后端转发（避免浏览器跨域 CORS）
-                </label>
-                <label class="checkbox_label so-nb-toggle-row">
-                  <input type="checkbox" id="so-nb-conn-rawurl" ${s.connDirectRawUrl ? 'checked' : ''}>
-                  地址原样使用（不自动补 /v1）
-                </label>
+              <label class="so-nb-field">
+                <span>API 密钥</span>
+                <input type="password" id="so-nb-conn-apikey" value="${escapeAttr(s.connApiKey)}" placeholder="sk-...">
+              </label>
+              <div class="so-nb-conn-row">
+                <button type="button" id="so-nb-conn-fetch" class="so-next-beat-btn so-next-beat-use">🔍 拉取模型列表</button>
+                <span class="so-nb-conn-status" id="so-nb-conn-status"></span>
               </div>
-              <div id="so-nb-conn-profile">
-                <label class="so-nb-field">
-                  <span>配置文件</span>
-                  <input type="text" id="so-nb-conn-profileid" value="${escapeAttr(s.connProfileId)}" placeholder="Connection Profile ID">
-                </label>
-              </div>
+              <label class="so-nb-field">
+                <span>模型（从拉取结果中选择）</span>
+                <select id="so-nb-conn-model-select"></select>
+              </label>
+              <label class="checkbox_label so-nb-toggle-row">
+                <input type="checkbox" id="so-nb-conn-backend" ${s.connDirectViaBackend ? 'checked' : ''}>
+                经酒馆后端转发（避免浏览器跨域 CORS）
+              </label>
+              <label class="checkbox_label so-nb-toggle-row">
+                <input type="checkbox" id="so-nb-conn-rawurl" ${s.connDirectRawUrl ? 'checked' : ''}>
+                地址原样使用（不自动补 /v1）
+              </label>
             </div>
           </div>
         </details>
@@ -992,6 +965,7 @@
 
     panelEl.querySelector('.so-nb-panel-close').addEventListener('click', () => togglePanel(false));
 
+    // —— 开关 ——
     const bindToggle = (id, key) => {
       const el = panelEl.querySelector(id);
       el.addEventListener('change', function () {
@@ -1001,17 +975,32 @@
         syncSettingsUI();
         if (key === 'showChip') refreshChips();
         if (key === 'showFloat') applyFloatVisibility();
-        if (key === 'connInherit') applyConnVisibility();
       });
     };
     bindToggle('#so-nb-panel-enabled', 'enabled');
     bindToggle('#so-nb-panel-chip', 'showChip');
     bindToggle('#so-nb-panel-toast', 'showToast');
     bindToggle('#so-nb-panel-float', 'showFloat');
-    bindToggle('#so-nb-conn-inherit', 'connInherit');
     bindToggle('#so-nb-conn-backend', 'connDirectViaBackend');
     bindToggle('#so-nb-conn-rawurl', 'connDirectRawUrl');
 
+    // —— 连接模式 radio ——
+    panelEl.querySelector('#so-nb-conn-use-sy').addEventListener('change', function () {
+      if (!this.checked) return;
+      const st = loadSettings();
+      st.useOwnConnection = false;
+      saveSettings();
+      applyConnVisibility();
+    });
+    panelEl.querySelector('#so-nb-conn-use-own').addEventListener('change', function () {
+      if (!this.checked) return;
+      const st = loadSettings();
+      st.useOwnConnection = true;
+      saveSettings();
+      applyConnVisibility();
+    });
+
+    // —— 独立连接字段 ——
     const bindInput = (id, key) => {
       const el = panelEl.querySelector(id);
       el.addEventListener('input', function () {
@@ -1020,23 +1009,54 @@
         saveSettings();
       });
     };
-    bindInput('#so-nb-conn-model-override', 'connModelOverride');
     bindInput('#so-nb-conn-endpoint', 'connEndpoint');
     bindInput('#so-nb-conn-apikey', 'connApiKey');
-    bindInput('#so-nb-conn-model', 'connModel');
-    bindInput('#so-nb-conn-profileid', 'connProfileId');
 
-    const modeSel = panelEl.querySelector('#so-nb-conn-mode');
-    modeSel.addEventListener('change', function () {
-      const st = loadSettings();
-      st.connMode = this.value === 'profile' ? 'profile' : 'direct';
-      saveSettings();
-      applyConnVisibility();
+    // —— 拉取模型 ——
+    panelEl.querySelector('#so-nb-conn-fetch').addEventListener('click', async () => {
+      const btn = panelEl.querySelector('#so-nb-conn-fetch');
+      const status = panelEl.querySelector('#so-nb-conn-status');
+      const old = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '拉取中…';
+      status.textContent = '';
+      status.classList.remove('so-nb-conn-status-err');
+      try {
+        const list = await fetchModelList();
+        if (!list.length) {
+          status.textContent = '服务商没有返回任何模型';
+          status.classList.add('so-nb-conn-status-err');
+          return;
+        }
+        const st = loadSettings();
+        st.connModelList = list;
+        // 如果当前 connModel 不在新列表里 → 清空，让用户重选
+        if (!list.includes(st.connModel)) st.connModel = '';
+        saveSettings();
+        renderModelSelect();
+        status.textContent = `✓ 拉取到 ${list.length} 个模型`;
+      } catch (err) {
+        status.textContent = '拉取失败：' + ((err && err.message) || err);
+        status.classList.add('so-nb-conn-status-err');
+        console.error('[next-beat] 拉取模型失败：', err);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = old;
+      }
     });
 
+    // —— 模型下拉 ——
+    panelEl.querySelector('#so-nb-conn-model-select').addEventListener('change', function () {
+      const st = loadSettings();
+      st.connModel = this.value;
+      saveSettings();
+    });
+
+    // 恢复上次拉取的模型列表
+    renderModelSelect();
     applyConnVisibility();
 
-    // 面板 = 快捷生成：点完立刻收起；结果只会进楼层 chip。
+    // 面板 = 快捷生成
     panelEl.querySelector('#so-nb-panel-regen').addEventListener('click', async () => {
       const ctx = getCtx();
       if (!ctx || !ctx.chat || !ctx.chat.length) return;
@@ -1053,21 +1073,11 @@
     return panelEl;
   }
 
-  // 按 connInherit / connMode 显隐连接子面板
   function applyConnVisibility() {
     if (!panelEl || !panelEl.isConnected) return;
     const s = loadSettings();
     const ownBox = panelEl.querySelector('#so-nb-conn-own');
-    const directBox = panelEl.querySelector('#so-nb-conn-direct');
-    const profileBox = panelEl.querySelector('#so-nb-conn-profile');
-    const modelOverrideField = panelEl.querySelector('#so-nb-conn-model-override');
-    if (ownBox) ownBox.style.display = s.connInherit ? 'none' : '';
-    if (directBox) directBox.style.display = s.connMode === 'direct' ? '' : 'none';
-    if (profileBox) profileBox.style.display = s.connMode === 'profile' ? '' : 'none';
-    if (modelOverrideField) {
-      const label = modelOverrideField.closest('label');
-      if (label) label.style.display = s.connInherit ? '' : 'none';
-    }
+    if (ownBox) ownBox.style.display = s.useOwnConnection ? '' : 'none';
   }
 
   function setPanelSuggestion(options) {
@@ -1115,7 +1125,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // 悬浮球（极简：状态 + 两个按钮）
+  // 悬浮球
   // -------------------------------------------------------------------------
 
   const FLOAT_ID = 'so-nb-float';
@@ -1389,7 +1399,10 @@
       set('so-nb-panel-chip', s.showChip);
       set('so-nb-panel-toast', s.showToast);
       set('so-nb-panel-float', s.showFloat);
-      set('so-nb-conn-inherit', s.connInherit);
+      const rSy = panelEl.querySelector('#so-nb-conn-use-sy');
+      const rOwn = panelEl.querySelector('#so-nb-conn-use-own');
+      if (rSy) rSy.checked = !s.useOwnConnection;
+      if (rOwn) rOwn.checked = !!s.useOwnConnection;
       applyConnVisibility();
     }
   }
@@ -1445,7 +1458,6 @@
     bindToggle('so_next_beat_float', 'showFloat');
   }
 
-  // HTML 属性转义
   function escapeAttr(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
       return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
