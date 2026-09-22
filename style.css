@@ -1,5 +1,5 @@
 /* ============================================================================
- * 故事神谕 · 下一拍建议 —— v3.4.0
+ * 故事神谕 · 下一拍建议 —— v3.5.0
  * ========================================================================== */
 
 /* ---- Chip：贴在 AI 回复下方（候选结果的唯一展示位）------------------- */
@@ -68,8 +68,6 @@
   color: #e88;
   margin-top: 4px;
 }
-
-/* 「跳到最新候选」时的闪烁高亮 */
 .so-next-beat-chip.so-nb-flash {
   border-color: rgba(74, 144, 217, 0.95);
   box-shadow: 0 0 0 3px rgba(74, 144, 217, 0.35);
@@ -181,7 +179,7 @@
   top: 12vh;
   left: 50%;
   transform: translateX(-50%) scale(0.96);
-  width: min(360px, calc(100vw - 16px));
+  width: min(380px, calc(100vw - 16px));
   max-height: calc(100dvh - 24px);
   overflow: hidden;
   display: flex;
@@ -272,6 +270,56 @@
 .so-nb-panel-row { display: flex; gap: 8px; margin-top: 4px; }
 .so-nb-panel-row .so-next-beat-btn { flex: 1; text-align: center; padding: 6px 10px; }
 
+/* ---- 连接设置子面板 --------------------------------------------------- */
+
+.so-nb-conn {
+  margin-top: 6px;
+  border-radius: 8px;
+  background: rgba(128, 128, 128, 0.08);
+  padding: 4px 8px;
+}
+.so-nb-conn > summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.9em;
+  padding: 4px 0;
+  user-select: none;
+}
+.so-nb-conn-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 0 4px;
+}
+.so-nb-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.85em;
+}
+.so-nb-field > span {
+  opacity: 0.75;
+}
+.so-nb-field > input,
+.so-nb-field > select {
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
+  background: rgba(0, 0, 0, 0.15);
+  color: inherit;
+  font-size: 0.95em;
+  width: 100%;
+  box-sizing: border-box;
+}
+#so-nb-conn-own {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-left: 4px;
+  border-left: 2px solid rgba(128, 128, 128, 0.25);
+  margin-top: 4px;
+}
+
 /* ---- 悬浮球 / 悬浮窗（极简：状态 + 两按钮）--------------------------- */
 
 #so-nb-float {
@@ -352,8 +400,6 @@
   user-select: none;
 }
 #so-nb-float .so-nb-float-icon-btn:hover { opacity: 1; }
-
-/* 悬浮球卡片正文：只放一句话状态，绝不显示候选列表 */
 #so-nb-float .so-nb-float-content {
   padding: 10px 12px;
   font-size: 0.88em;
@@ -362,7 +408,6 @@
   word-break: break-word;
   white-space: pre-wrap;
 }
-
 #so-nb-float .so-nb-float-actions {
   display: flex;
   gap: 6px;
